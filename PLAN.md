@@ -49,11 +49,14 @@ Pipeline, in rule order:
 Why not DuckDB/Polars/Spark: the work is dominated by parsing ~5–6 GB of CSV whose dialect those readers don't follow, and Python/JVM startup is timed.
 
 - **Image:** multi-stage build → static binary in `FROM scratch`/distroless. Build with `-C target-cpu=x86-64-v4`, LTO, `panic=abort`, mimalloc.
-- **Read/parse:** mmap files, split chunks at newlines across 8 threads, `memchr`/SIMD scanning, hand-written fixed-offset timestamp parsers with days-from-civil validation. Parse only needed fields. Intern IDs as integers.
-- **Dedup:** partition events by a 64-bit hash of `event_id` so each thread dedups its own shard lock-free; full string compare only on hash collision. Carry a valid flag through dedup (validation happens after).
+- **Read/parse:** mmap files, split chunks at newlines across 8 threads (not one file per thread: the largest file holds ~1/5 of the rows), `memchr`/SIMD scanning, hand-written fixed-offset timestamp parsers with days-from-civil validation. Parse only needed fields.
+- **IDs as packed `u128`, not an interning table:** every event/user/product ID in the data is 8–11 bytes, so pack the bytes into a `u128` (length in the top byte). Exact equality and byte-wise order with no shared, contended dictionary; IDs over 15 bytes go to a rare slow path.
+- **Dedup:** partition events by a hash of the packed `event_id` so each thread dedups its own shard lock-free. Carry a valid flag through dedup (validation happens after).
+- **Then re-partition by person.** Dedup buckets are keyed by event, sessions by person: a second scatter pass is required. About 1 in 64 duplicated events name a different user in later copies, and the earliest copy's user is the one that counts.
+- **Skip click dedup:** copies of a click have identical values, so they cannot change the credit (a tie resolves to the same `click_id`) or assists (each campaign counts once).
 - **Links:** union-find over interned IDs; min ID per root.
 - **Sessionize:** sort compact records (person, ts, type, category, price) per partition; one linear pass.
-- **Attribution/assists:** sliding 7-day window over each person's sorted clicks with per-campaign counts — O(n) even for whales and shared devices.
+- **Attribution/assists:** sort clicks by `(person, ts, click_id)` so the credit tie-break falls out of the order; sliding 7-day window over each person's clicks with per-campaign counts — O(n) even for whales and shared devices.
 - **Output:** `campaign_daily` is tiny; write `user_daily` as several uncompressed Parquet files in parallel.
 - **Memory:** keep peak ≲ 10 GB at 60M events.
 
@@ -64,26 +67,38 @@ Why not DuckDB/Polars/Spark: the work is dominated by parsing ~5–6 GB of CSV w
 - Minimal hand-rolled Parquet writer if the crate's overhead shows up.
 - Optimize for the 60M final, not just the 20M practice set.
 
+### Traps that need a named test
+
+- F3 with any number of leading zeros (`0001791071890000`), or longer than an i64: not malformed, just out of window.
+- Offsets: `-00:00` and `+23:59` valid; `+24:00`, `+05:60`, `+0200` bad. Feb 29 valid only in leap years (some windows hold 2028-02-29).
+- Dedup before validation: an invalid earliest copy drops the event; a later valid copy does not rescue it. A malformed copy never counts.
+- Equal timestamps share a session regardless of read order (E16).
+- Links: a data row equal to the header is data (L3); upper-cased IDs sort before lowercase and can become the name; self-links and repeats are no-ops.
+- Header-only files; a final line without `\n`; `\r` is data (`1000\r` is a bad price).
+
 ## Risks
 
 1. **Correctness** — the biggest risk. Differential testing against the reference is mandatory.
 2. **Disk I/O floor** — if `/data` isn't page-cached, reading ~6 GB may cost seconds no matter what. Check scaling on early practice submissions.
 3. **Competition** — others will go native too; the race is decided by parse speed, lock-free partitioning, allocations, and I/O.
-4. **Time** — reference ~4–6 h, first fast version ~8–12 h, then tuning.
+4. **Time** — deadline is ~1.5 days out. The reference is done; the next milestone is a simple single-threaded Rust version that matches it, submitted **today** (ties go to the earlier submission, 2 submissions/hour). The Python reference is not submittable: ~13 s per 1M events would be ~4 min and far too much memory at 20M.
 
 ## Setup checklist
 
+`make setup` does the venv, generator and dev-answer steps below. See the Makefile for `fixtures`, `check-dev`, `diff-seeds` (each takes `CAND=...`).
+
 - [ ] Install Docker buildx (`make build` needs it; Arch: `sudo pacman -S docker-buildx`).
-- [ ] Build the generator: unzip `generator.zip`, `cargo build --release`, put `generate` on PATH.
-- [ ] Generate dev set: `generate --seed 1 --events 1000000 --clicks 250000 --output dev`; plus a 20M set for timing (60M needs lots of RAM/disk).
-- [ ] `uv pip install polars` for `scripts/compare.py` and `scripts/run_fixtures.py`.
-- [ ] Copy the starter harness (`fixtures/`, `scripts/`, `Makefile`, `.dockerignore`) from any starter zip; replace the pipeline with a Rust crate + two-stage Dockerfile.
-- [ ] `.gitignore` for `dev/`, `out/`, `target/`, generated data; unzip `dev-answer` locally for `make check-dev`.
+- [x] Build the generator: unzip `generator.zip`, `cargo build --release`, put `generate` on PATH.
+- [ ] Generate dev set: `generate --seed 1 --events 1000000 --clicks 250000 --output dev`; plus a 20M set for timing (the 60M set is ~5.5 GB on disk).
+- [x] `uv pip install polars` for `scripts/compare.py` and `scripts/run_fixtures.py`.
+- [x] Copy the starter harness (`fixtures/`, `scripts/`, `Makefile`, `.dockerignore`) from a starter zip.
+- [ ] Rust crate + two-stage Dockerfile.
+- [x] `.gitignore` for `dev/`, `out/`, `target/`, generated data; unzip `dev-answer` locally for `make check-dev`.
 - [ ] Keep the repo public; fill in `TEAM.md`.
 
 ## Milestones
 
-1. Harness + reference passing fixtures and `dev-answer` → **submit**.
-2. Differential test harness across many generator seeds.
+1. ~~Harness + reference passing fixtures and `dev-answer`~~ — done: `reference/reference.py` passes 36/36 fixtures and matches `dev-answer` exactly (13 s on 1M events).
+2. ~~Differential test harness across many generator seeds~~ — done: `scripts/diff_seeds.py` / `make diff-seeds CAND=...`.
 3. Fast Rust pipeline matching the reference → **submit**.
 4. Profile on 20M/60M, tune, resubmit (≤ 2/hour).

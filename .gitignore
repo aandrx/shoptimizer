@@ -1,0 +1,11 @@
+.venv/
+dev/
+out/
+out-*/
+data/
+target/
+dev-answer/
+__pycache__/
+*.pyc
+.DS_Store
+.tools/
