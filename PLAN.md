@@ -21,7 +21,7 @@ This file is written so one orchestrator session can hand each task in §6 to a 
 2. One task = one branch `t<NN>-<slug>` (use a git worktree for parallel tasks). Commit locally. Only the orchestrator merges to `main`, and only after the task's acceptance passes on the merged result.
 3. A task is **done** only when every acceptance command passes. "Should work" is not done.
 4. Every change to pipeline code must pass gate **G1** (§7). Performance tasks must also pass **G3**.
-5. **Sandbox:** agents cannot reach GitHub (no push, pull or fetch) and cannot use `sudo`. Hand those to the human.
+5. **Sandbox:** GitHub access (push, pull, fetch) depends on the machine: some agent sandboxes have it, some don't. Check with `git fetch` before assuming either way. Agents never use `sudo`. Hand those to the human.
 6. Do not relitigate §4 decisions. If a task seems to need a different decision, stop and ask the orchestrator.
 7. The pipeline writes logs to **stderr only**. Stdout stays effectively empty (the scorer caps it at 50 MB).
 8. Never commit `data/`, `.tools/`, `.venv/`, `target/`, `out*/`, or generated datasets. The repo must stay < 50 MB.
@@ -34,7 +34,7 @@ This file is written so one orchestrator session can hand each task in §6 to a 
 Read messy CSVs from `/data`, write two Parquet tables to `/output/user_daily/` and `/output/campaign_daily/`, exactly as `rules.md` defines.
 
 - **Score = wall-clock seconds, container start → exit. Lower wins.** Any wrong row scores nothing.
-- Run box: linux/amd64 GCP n2 Xeon (Cascade Lake or newer), **8 vCPU, 24 GB RAM, no swap, no network**. `/data` read-only, `/scratch` writable, root FS read-only (`/tmp` 64 MB), uid 1000. Env: `DATA_DIR OUTPUT_DIR SCRATCH_DIR NCPU=8 MEM_GB=24`.
+- Run box: linux/amd64 GCP n2 Xeon (Cascade Lake or newer), **8 vCPU (= 4 physical cores with hyperthreads, so per-core parse speed matters), 24 GB RAM, no swap, no network**. `/data` read-only, `/scratch` writable, root FS read-only (`/tmp` 64 MB), uid 1000. Env: `DATA_DIR OUTPUT_DIR SCRATCH_DIR NCPU=8 MEM_GB=24`.
 - Gate: public dev set (1M events) must match, < 3 min. Practice board: hidden ~20M events. **Final: fresh ~60M events, 3-min cap per run, median of 3**; the top 5+ are re-timed 5×.
 - Hidden-data feedback is only exit code, OOM flag, and counts of missing/extra/differing rows.
 - Limits: **3 submissions/hour** (was 2; can change), a rejected entry still counts, ties go to the earlier submission, ~20% machine variance. See §8 for the form.
@@ -49,7 +49,7 @@ Read messy CSVs from `/data`, write two Parquet tables to `/output/user_daily/` 
 |---|---|---|
 | `rules.md` | The spec | given, frozen |
 | `fixtures/` | 36 edge cases: `input/` + `expected/*.csv` | given, frozen |
-| `reference/reference.py` | Literal Python implementation. 36/36 fixtures, matches `dev-answer`. ~13 s per 1M events | done, frozen |
+| `reference/reference.py` | Literal Python implementation. 36/36 fixtures, matches `dev-answer`. ~13 s and **~740 MB peak RSS per 1M events** (measured) | done, frozen |
 | `scripts/run_fixtures.py` | Runs `CMD` on every fixture, exact diff | done |
 | `scripts/compare.py` | Exact order-insensitive diff of two output folders | done |
 | `scripts/diff_seeds.py` | Runs candidate + reference on many generator seeds, diffs (cached in `data/`) | done |
@@ -93,16 +93,16 @@ CPUS=8 MEM=24g scripts/docker_run.sh data/p20 out-p20   # timed practice-size ru
 | D1 | **Rust, one binary.** No DuckDB/Polars/Spark/Python at run time. | The work is CSV parsing whose dialect those readers don't follow; Python/JVM startup is timed. |
 | D2 | **V1 first:** simple, single-threaded, `&[u8]`/`Vec<u8>` IDs, correct. Submit it. **V2** adds speed behind the same tests. | Bank a correct score early (ties go to the earlier submission). V1 stays as the fallback path. |
 | D3 | Dependency allow-list: `parquet` (`default-features = false`, no arrow, uncompressed), `rayon`, `memmap2`, `mimalloc`, `hashbrown`. Nothing else without approval. | Scorer build ≤ 10 min. |
-| D4 | Docker: builder `rust:1.97-bookworm` (matches local rustc 1.97) with a dependency-cache layer; runtime `gcr.io/distroless/cc-debian12`; `ENTRYPOINT ["/shoptimizer"]`. | Small image, fast start. |
+| D4 | Docker: builder `rust:1.97-bookworm` (matches local rustc 1.97) with a dependency-cache layer; runtime `gcr.io/distroless/cc-debian12`; `ENTRYPOINT ["/shoptimizer"]`. | Small image, fast start. Distroless has no `chmod`, so `scripts/docker_run.sh` cleans up with `busybox:1.36` instead (fixed). |
 | D5 | Build flags in `.cargo/config.toml`: `target-cpu=x86-64-v3`, plus release profile `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`. `x86-64-v4` only via the T13 A/B. | AVX-512 downclocks Cascade Lake. Local Zen 4 has no penalty, so local tests flatter v4. |
 | D6 | **Packed IDs (V2):** `u128`, ID bytes big-endian from bit 127 down, zero-padded, **length in the lowest byte**. Integer `<` then equals byte-wise order. IDs > 15 bytes: the whole run falls back to the V1 path (a flag set during parse). | No shared interning table. Measured: all IDs ≤ 9 bytes in generated data, so the fallback is for safety only. |
 | D7 | **No click dedup.** Copies are identical, so they can't change credit or assists. Assist window counts only need `> 0`. | Saves a hash pass over ~15M clicks. |
 | D8 | **Dedup events globally first** (partition by `event_id` hash), **then** re-partition by person. | The kept copy may name a different user (E4). |
 | D9 | Parallel parse splits files into **fixed byte ranges aligned to `\n`**, size from env `SHOPT_CHUNK_BYTES` (default 32 MiB). | File sizes are skewed (one file ≈ 16% of the data). The env var lets small tests exercise many chunks. |
 | D10 | Parquet: `INT64` for counts, `INT32` + logical `DATE` for `day`, `BYTE_ARRAY` + `String` for strings, `top_category` nullable, no compression. | Matches the checker. Cheap to write. |
-| D11 | **V1 is the big-data oracle** (gate G4) and the **runtime fallback** for V2. Never change V1's behaviour. | It matched the hidden 20M set exactly. |
+| D11 | **Oracle by dataset size.** `reference/reference.py` up to ~2M events. Above that, the **V1 binary** (gate G4). V1 is also the **runtime fallback** for V2. Never change V1's behaviour. | V1 matched the hidden 20M set exactly. The Python reference needs ~740 MB per 1M events (~15 GB at 20M, ~45 GB at 60M), so it can't run at those sizes on a laptop. |
 | D12 | **Copy validity is computed at parse.** Every check in rules.md Events steps 3–4 (incl. late) depends only on the copy itself, so dedup only compares `(event_id, ingest)` and keeps the record with its `VALID` flag. | Dedup becomes a tiny per-bucket operation. |
-| D13 | Fixed-size records (`EvRaw`, `Ev`, `Ck`, §6) with `u128` IDs stored as `[u64; 2]` and timestamps as `u32` ms offsets (event: from `window_start`; click: from `window_start − 7 d`). If the window + 7 d doesn't fit in `u32` ms (~49 days), fall back to V1. | Halves memory traffic vs i64 + slices. 21 days = 1.8e9 ms fits. |
+| D13 | Fixed-size records (`EvRaw`, `Ev`, `Ck`, §6; §5a O7) with `u128` IDs stored as `[u64; 2]`. Timestamps are `u32` ms offsets (event: from `window_start`; click: from `window_start − 7 d`). `ingest_ts` (always whole-second F1) is stored as `i32` **seconds** from `window_start`, exact even on invalid copies, because dedup compares it across copies. The late check runs at parse on full-precision values. Fall back to V1 if any `ingest_ts` is out of `i32` range, or the window + 7 d doesn't fit in `u32` ms (~49 days). | Smaller records mean less memory traffic on every scatter and sort. 21 days = 1.8e9 ms fits. |
 | D14 | Pass structure P0–P4 (§6) with `2^B` buckets, `B` from `SHOPT_BUCKET_BITS` (default 8). Per-bucket `hashbrown` tables pre-sized to bucket length. | Each bucket's table fits in L2; no locks. |
 | D15 | Assists: per-worker count array over campaign index + active list with swap-remove. Never rescan the click window per session. | The shared-device person has thousands of clicks in a window. |
 | D16 | `user_daily` rows fold in-stream (a person's sessions arrive in ts order, so days don't decrease). `campaign_daily` uses dense per-worker `[campaign][day]` arrays merged at the end. No output hash maps. | Removes V1's slowest random-access maps. |
@@ -159,6 +159,36 @@ Data flow (V2): `mmap files → byte-range chunks → parse (parallel) → scatt
 
 **The V2 module contracts (`src/id.rs`, `src/v2/{types,scan,parse,people,sessions,write,mod}.rs`) are in the §6 task cards T20–T26.** They replace the earlier V2 sketch.
 
+### 5a. Optimization playbook (V2)
+
+Mainstream engine techniques, mapped onto this workload. V2 tasks follow this; T13 measures each.
+
+**What does *not* apply.** Predicate/projection pushdown into storage, zone maps, row-group stats and Bloom-filter skipping all need a format with metadata. CSV has none: every byte must be scanned to find row boundaries. Here "pushdown" means doing the least work per field *inside the parser*, not skipping input.
+
+| # | Technique | Applied here | Task |
+|---|---|---|---|
+| O1 | **Fused single pass** (HyPer-style data-centric pipeline) | One loop per chunk: parse → encode → filter → scatter into buckets. No intermediate row tables; each input byte touched once | T22, T26 |
+| O2 | **Morsel-driven parallelism** | Fixed byte-range chunks pulled from a shared queue (rayon), not one file per thread (largest file ≈ 16% of data) | T21 (D9) |
+| O3 | **SIMD scanning** (simdjson / simdcsv) | Find `,` `"` `\n` 32–64 bytes at a time as bitmasks. Only 4 physical cores, so per-core parse speed decides the race | T13 |
+| O4 | **Early filtering, bounded by dedup** | *Clicks*: drop at parse time (bad campaign, out of window, empty user/id); they need no dedup. *Events*: dedup comes before validation, so a row that fails validation still takes part in dedup, but only its `(event_id, ingest_ts, invalid)` matters; leave its other fields zero | T22 |
+| O5 | **Dictionary encoding at parse** | category → `u16` index (D17), campaign → `u16` (≤ 2000 + `organic`), event_type → flag bits, price → `u32`. `products.csv` / `campaigns.csv` are tiny lookup tables: a lookup at parse, no join | T22 |
+| O6 | **Late materialization** | IDs stay packed `u128` (D6) end to end; strings are rebuilt only when writing Parquet | T20, T25 |
+| O7 | **Compact records** | D13: `ingest_ts` as exact `i32` seconds (fallback if out of range), `ts` as `u32` ms offsets, `EvRaw` 48 B, `Ev` 32 B | T22, T26 |
+| O8 | **Radix partitioning** (DuckDB / HyPer joins) | Scatter into 2^k cache-sized buckets (k ≈ 8–10, per-worker buffers), then hash inside each: dedup by `event_id`, then re-partition by person | T26 (D8, D14) |
+| O9 | **Radix sort** | (person, ts) per bucket as one `u64` key (person index within bucket + ts offset); LSD radix sort, typically 2–4× faster than `sort_unstable` at this size | T13 (T24 starts with `sort_unstable`) |
+| O10 | **Partial / pre-aggregation** | `campaign_daily`: fixed per-worker array `[campaign_idx][day]`, summed at the end. `user_daily`: rows come out of the per-person walk in order, no hash table | T24 (D16) |
+| O11 | **Early read-ahead** | At startup, `madvise(MADV_WILLNEED)` on every mmapped file so the kernel reads ahead while threads parse. Only matters if the scorer's disk is cold; cheap either way | T21 |
+| O12 | **No allocation in hot loops** | Pre-sized per-worker buckets and buffers, reused across chunks; `mimalloc` | T21–T26 |
+
+**Deliberately not done** (decided; measure in T13 only if profiling points there):
+- **Output compression:** ~7M rows ≈ 150 MB uncompressed. Snappy/zstd costs more CPU than the write saves, and the 50 GB space limit is never close.
+- **Parquet dictionary encoding:** may help `channel` / `campaign_id` / `top_category`, but those columns are small. T13 A/B only.
+- **Deferring `ts` parse for duplicate copies:** ~97% of events are unique, so nearly every copy is the kept one. Deferring turns one sequential pass into random reads back into the file.
+- **Spilling:** working set ~3–6 GB vs 24 GB. Never spill.
+- **Cross-run caching or dataset fingerprinting:** every run is a fresh container on new data, and rules.md says nothing about a dataset can be hard-coded.
+
+**Expected order of payoff:** O1+O2 (fused, morsel-parallel parse) > O3 (SIMD) > O7+O5 (compact, encoded records) > O9 (radix sort) > O11 (read-ahead, insurance for a cold disk).
+
 ---
 
 ## 6. Tasks
@@ -168,6 +198,7 @@ Data flow (V2): `mmap files → byte-range chunks → parse (parallel) → scatt
 | Done | Result |
 |---|---|
 | H1, T00–T06, H2 | **V1 scored 40.95 s on hidden 20M, exact match.** Local native 36.2 s → scorer ≈ 1.13× local. |
+| V1 merge | Two V1s were built in parallel (PR #1, and one on `main`). Both passed G1, with identical output on p20. The merge keeps **PR #1's code** (36 s vs 50 s at 20M; 50 vs 33 unit tests; it's the submitted SHA). The other V1 stays in history (`ce9edff`). |
 | T07–T12 | **Superseded** by the Submission #2 cards below (T20–T28). T13–T15 still apply after #2. |
 
 ### Where V1's time goes (20M, local, single thread)
@@ -209,14 +240,15 @@ Scatter = each worker pushes into its own `Vec` per bucket (`workers × 2^B` vec
 **Record layouts (D13):** store `u128` as `[u64; 2]` so records align to 8.
 
 ```rust
-pub struct EvRaw { id: u128, user: u128, ingest: i64, ts: u32, price: u32, cat: u16, flags: u8 } // ≤ 56 B
+pub struct EvRaw { id: u128, user: u128, ingest_s: i32, ts: u32, price: u32, cat: u16, flags: u8 } // 48 B
+// ingest_s = exact seconds since window_start (D13). Invalid copies: only id, ingest_s, flags matter (O4)
 // ts = ms since window_start (only meaningful when VALID); flags: VALID | PURCHASE
 pub struct Ev    { person: u128, ts: u32, price: u32, cat: u16, purchase: bool }               // 32 B
 pub struct Ck    { person: u128, click_id: u128, ts: u32, campaign: u16 }                      // ≤ 40 B
 // Ck.ts = ms since (window_start − 7 d)
 ```
 
-Memory at 60M: EvRaw ≈ 3.4 GB + Ev ≈ 1.9 GB + Ck ≈ 0.6 GB + mmapped input (page cache).
+Memory at 60M: EvRaw ≈ 3.0 GB + Ev ≈ 1.9 GB + Ck ≈ 0.6 GB + mmapped input (page cache).
 
 ### Dependency graph (Submission #2)
 
@@ -243,14 +275,14 @@ Wave 1 tasks are pure functions with unit tests and don't depend on each other's
 ---
 
 **T21 — Chunking and mmap** · Scope: `src/v2/scan.rs` · Depends: —
-- Contract: `pub fn map_dir(dir: &Path) -> io::Result<Vec<Mmap>>` (every `*.csv`; **zero-length files are skipped, since mmap of an empty file fails**) · `pub fn chunks<'a>(files: &'a [Mmap], target: usize) -> Vec<&'a [u8]>`. Each chunk holds only whole data lines: the header is excluded, a chunk ends just after a `\n` or at EOF, and no line is split or repeated. Use `target` from `SHOPT_CHUNK_BYTES` (default 32 MiB).
+- Contract: `pub fn map_dir(dir: &Path) -> io::Result<Vec<Mmap>>` (every `*.csv`; **zero-length files are skipped, since mmap of an empty file fails**) · `pub fn chunks<'a>(files: &'a [Mmap], target: usize) -> Vec<&'a [u8]>`. Each chunk holds only whole data lines: the header is excluded, a chunk ends just after a `\n` or at EOF, and no line is split or repeated. Use `target` from `SHOPT_CHUNK_BYTES` (default 32 MiB). Call `madvise(MADV_WILLNEED)` on each map (O11).
 - Accept: `cargo test scan`. For chunk sizes 1, 7, 64, 4096 and the default, the concatenation of `csv::data_lines` over all chunks equals `csv::data_lines` over each whole file. Cover: header-only file, file with no `\n` at all, last line without `\n`, `\r\n` lines, an empty line in the middle, a 0-byte file.
 
 ---
 
 **T22 — Row parsers** · Scope: `src/v2/parse.rs`, plus `pub(crate)` on `v1::parse_price` and `v1::kind_of` · Depends: `types.rs`, T20 (`pack` signature only)
 - Contract: `pub enum Parsed<T> { Skip, Overflow, Rec(T) }` · `pub fn event(line: &[u8], ctx: &Ctx) -> Parsed<EvRaw>` · `pub fn click(line: &[u8], ctx: &Ctx) -> Parsed<(u128 /*user*/, Ck /*person unset*/)>`.
-- Rules: `Skip` = malformed line or empty `event_id`/`click_id`, or for clicks any failed validation (no click dedup, D7). `Overflow` = any ID that must be packed is > 15 bytes. EvRaw `VALID` = every per-copy check from rules.md "Events" steps 3–4 (user, ts in window, type, product, purchase price, **not late**). Unknown product → the `unknown` category index.
+- Rules: `Skip` = malformed line or empty `event_id`/`click_id`, or for clicks any failed validation (no click dedup, D7). `Overflow` = any ID that must be packed is > 15 bytes. EvRaw `VALID` = every per-copy check from rules.md "Events" steps 3–4 (user, ts in window, type, product, purchase price, **not late**). Unknown product → the `unknown` category index. `Overflow` also when `ingest_ts` doesn't fit D13's `i32` seconds. Apply §5a O4, O5, O7.
 - Accept: `cargo test parse`, with cases for E5 (invalid copy still `Rec` with `VALID` unset), E6 (exactly 24 h kept, +1 s dropped), E10, E12, E13, E17, E18, E19, E20, A6, A10 (click window edges), and a product absent from `products.csv`.
 
 ---
@@ -264,7 +296,7 @@ Wave 1 tasks are pure functions with unit tests and don't depend on each other's
 
 **T24 — Session kernel** · Scope: `src/v2/sessions.rs` · Depends: `types.rs`
 - Contract: `pub fn run_bucket(evs: &mut [Ev], cks: &mut [Ck], ctx: &Ctx, acc: &mut Acc)` · `pub struct Acc { pub users: Vec<UserRow>, pub camp: Vec<[i64; 4]> /* (n_campaigns + 1 organic) × n_days: sessions, purchasing, revenue, assisted */, scratch… }` · `pub struct UserRow { person: u128, day: i32, sessions: i64, events: i64, revenue: i64, top_cat: Option<u16> }`.
-- How: sort; sessionize (gap between distinct ts > 30 min); credit = first click of the latest-`ts` group in `[start − 7 d, start]`; assists via a per-`Acc` count array over campaign indices plus an active list with swap-remove (D15); consecutive sessions of the same person and day fold into one `UserRow` (D16); `top_cat` = max cents, ties → smallest index (D17).
+- How: sort (`sort_unstable`; radix sort O9 is a T13 follow-up); sessionize (gap between distinct ts > 30 min); credit = first click of the latest-`ts` group in `[start − 7 d, start]`; assists via a per-`Acc` count array over campaign indices plus an active list with swap-remove (D15); consecutive sessions of the same person and day fold into one `UserRow` (D16); `top_cat` = max cents, ties → smallest index (D17).
 - Accept: `cargo test v2::sessions`, porting A1–A12, E1–E3, E8, E9, E14, E16, L1 and L4 at the record level, plus a randomized test (≥ 500 cases, ≤ 50 events and ≤ 30 clicks each) against a naive O(n²) implementation written in the test module straight from rules.md.
 
 ---
@@ -305,6 +337,7 @@ Wave 1 tasks are pure functions with unit tests and don't depend on each other's
 
 **T14 — Build-flag A/B** · Scope: `.cargo/config.toml`, `Cargo.toml` · Depends: H5
 - Do: two commits, `x86-64-v3` vs `x86-64-v4`. The human submits both and keeps the faster (only trust gaps > 20%, or repeat).
+- **Low priority.** With ~20% board noise, one A/B costs two slots and will usually be inconclusive. Keep `x86-64-v3` unless spare slots remain after T13.
 - Accept: both pass G1 + G2.
 
 **T15 — 60M robustness** · Scope: none unless a fix is needed · Depends: T26

@@ -2,10 +2,13 @@
 dev/
 out/
 out-*/
-data/
+data
 target/
-dev-answer/
+dev-answer
 __pycache__/
 *.pyc
 .DS_Store
 .tools/
+.venv
+.tools
+.claude/
