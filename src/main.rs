@@ -1,18 +1,14 @@
-//! Binary entry point: CLI/env paths, phase timing, and output writing.
+//! Binary entry point: CLI/env paths, phase timing, and the V1 pipeline.
 //!
-//! T01 writes the two tables with zero rows and the exact schema. T05/T11 fill
-//! in the pipeline behind the same interface.
+//! Logs go to stderr only; stdout stays empty.
 
-// Stubs filled in by later tasks (T02-T11); unused until then.
-#[allow(dead_code)]
+mod agg;
 mod csv;
 mod output;
-#[allow(dead_code)]
 mod people;
-#[allow(dead_code)]
 mod ts;
-#[allow(dead_code)]
 mod v1;
+// Implemented by T08-T11; unused until then.
 #[allow(dead_code)]
 mod v2;
 
@@ -53,22 +49,16 @@ fn phase(name: &str, started: Instant) {
 }
 
 fn run() -> io::Result<()> {
-    let (_data, out) = match paths() {
+    let (data, out) = match paths() {
         Ok(paths) => paths,
         Err(message) => {
             eprintln!("{message}");
             return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
         }
     };
-    // T01: no pipeline yet; emit both tables with the exact schema and zero rows.
     let started = Instant::now();
-    output::write_user_daily(&out.join("user_daily"), &[])?;
-    phase("write_user_daily", started);
-
-    let started = Instant::now();
-    output::write_campaign_daily(&out.join("campaign_daily"), &[])?;
-    phase("write_campaign_daily", started);
-
+    v1::run(&data, &out)?;
+    phase("v1", started);
     Ok(())
 }
 
