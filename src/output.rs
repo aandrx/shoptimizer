@@ -82,7 +82,7 @@ fn write_optional<T: DataType>(
     col.close().map_err(parquet_err)
 }
 
-fn open_writer(dir: &Path, schema: &str) -> io::Result<SerializedFileWriter<File>> {
+fn open_writer(dir: &Path, schema: &str, name: &str) -> io::Result<SerializedFileWriter<File>> {
     std::fs::create_dir_all(dir)?;
     let schema = Arc::new(parse_message_type(schema).map_err(parquet_err)?);
     let props = Arc::new(
@@ -90,7 +90,7 @@ fn open_writer(dir: &Path, schema: &str) -> io::Result<SerializedFileWriter<File
             .set_compression(Compression::UNCOMPRESSED)
             .build(),
     );
-    let file = File::create(dir.join("part-0.parquet"))?;
+    let file = File::create(dir.join(name))?;
     SerializedFileWriter::new(file, schema, props).map_err(parquet_err)
 }
 
@@ -103,7 +103,12 @@ fn bytes<'a>(rows: impl Iterator<Item = &'a [u8]>) -> Vec<ByteArray> {
 /// Zero rows produce a valid Parquet file with the exact schema and no row
 /// groups.
 pub fn write_user_daily(dir: &Path, rows: &[UserDaily]) -> io::Result<()> {
-    let mut writer = open_writer(dir, USER_DAILY_SCHEMA)?;
+    write_user_daily_named(dir, "part-0.parquet", rows)
+}
+
+/// Like [`write_user_daily`], into file `name` (V2 writes one part per worker).
+pub fn write_user_daily_named(dir: &Path, name: &str, rows: &[UserDaily]) -> io::Result<()> {
+    let mut writer = open_writer(dir, USER_DAILY_SCHEMA, name)?;
     if !rows.is_empty() {
         let mut row_group = writer.next_row_group().map_err(parquet_err)?;
 
@@ -165,7 +170,7 @@ pub fn write_user_daily(dir: &Path, rows: &[UserDaily]) -> io::Result<()> {
 /// Zero rows produce a valid Parquet file with the exact schema and no row
 /// groups.
 pub fn write_campaign_daily(dir: &Path, rows: &[CampaignDaily]) -> io::Result<()> {
-    let mut writer = open_writer(dir, CAMPAIGN_DAILY_SCHEMA)?;
+    let mut writer = open_writer(dir, CAMPAIGN_DAILY_SCHEMA, "part-0.parquet")?;
     if !rows.is_empty() {
         let mut row_group = writer.next_row_group().map_err(parquet_err)?;
 

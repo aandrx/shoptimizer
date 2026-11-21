@@ -199,6 +199,7 @@ Mainstream engine techniques, mapped onto this workload. V2 tasks follow this; T
 |---|---|
 | H1, T00–T06, H2 | **V1 scored 40.95 s on hidden 20M, exact match.** Local native 36.2 s → scorer ≈ 1.13× local. |
 | V1 merge | Two V1s were built in parallel (PR #1, and one on `main`). Both passed G1, with identical output on p20. The merge keeps **PR #1's code** (36 s vs 50 s at 20M; 50 vs 33 unit tests; it's the submitted SHA). The other V1 stays in history (`ce9edff`). |
+| T20–T26 (V2.0) | Implemented on branch `v2`. **p20: ~2.6–2.8 s on 4 cores × 2 threads locally** (`NCPU=8 taskset -c 0-3,8-11`), vs V1 36 s. G1 passes at default, `SHOPT_CHUNK_BYTES=4096`, and `SHOPT_BUCKET_BITS=1 SHOPT_CHUNK_BYTES=100`; G4 `MATCH` vs V1 on p20; 2M seeds 41–43 match; forced V1 fallback (16-byte ID) matches the reference. Phases at p20: links+events parse 1.1 s, clicks 0.26 s, dedup 0.65 s, sessions 0.4 s, write 0.12 s. Peak RSS 5.5 GB (incl. 1.8 GB mapped input). `SHOPT_BUCKET_BITS` 8 vs 10 and 8 vs 32 MiB chunks: no measurable difference. |
 | T07–T12 | **Superseded** by the Submission #2 cards below (T20–T28). T13–T15 still apply after #2. |
 
 ### Where V1's time goes (20M, local, single thread)

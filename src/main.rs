@@ -1,16 +1,19 @@
-//! Binary entry point: CLI/env paths, phase timing, and the V1 pipeline.
+//! Binary entry point: CLI/env paths, engine choice (`SHOPT_ENGINE=v1|v2`,
+//! default v2), and phase timing.
 //!
 //! Logs go to stderr only; stdout stays empty.
 
 mod agg;
 mod csv;
+mod id;
 mod output;
 mod people;
 mod ts;
 mod v1;
-// Implemented by T08-T11; unused until then.
-#[allow(dead_code)]
 mod v2;
+
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::env;
 use std::io;
@@ -57,8 +60,19 @@ fn run() -> io::Result<()> {
         }
     };
     let started = Instant::now();
-    v1::run(&data, &out)?;
-    phase("v1", started);
+    if env::var("SHOPT_ENGINE").as_deref() == Ok("v1") {
+        v1::run(&data, &out)?;
+        phase("v1", started);
+    } else {
+        let threads = env::var("NCPU")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, usize::from));
+        let _ = rayon::ThreadPoolBuilder::new().num_threads(threads).build_global();
+        v2::run(&data, &out)?;
+        phase("total", started);
+    }
     Ok(())
 }
 

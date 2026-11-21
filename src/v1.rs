@@ -95,7 +95,7 @@ fn lookup_table(buf: &[u8]) -> HashMap<&[u8], &[u8]> {
 ///
 /// Leading zeros are fine (`0250` is 250). A value that would overflow the
 /// running total is over `MAX_PRICE` anyway, so it is invalid too; nothing wraps.
-fn parse_price(raw: &[u8]) -> i64 {
+pub(crate) fn parse_price(raw: &[u8]) -> i64 {
     if raw.is_empty() {
         return 0;
     }
@@ -131,7 +131,7 @@ struct EventRecord<'a> {
     price: i64,
 }
 
-fn kind_of(raw: Option<&[u8]>) -> u8 {
+pub(crate) fn kind_of(raw: Option<&[u8]>) -> u8 {
     match raw {
         Some(kind) if kind == b"view" => 1,
         Some(kind) if kind == b"cart" => 2,
