@@ -1,5 +1,13 @@
+data/
+.tools/
+.venv/
+target/
+out*/
+reference/
+scripts/
 fixtures/
+dev-answer/
+*.zip
 dev/
-out/
 *.md
 .git
