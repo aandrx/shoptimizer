@@ -37,7 +37,7 @@ Read messy CSVs from `/data`, write two Parquet tables to `/output/user_daily/` 
 - Run box: linux/amd64 GCP n2 Xeon (Cascade Lake or newer), **8 vCPU, 24 GB RAM, no swap, no network**. `/data` read-only, `/scratch` writable, root FS read-only (`/tmp` 64 MB), uid 1000. Env: `DATA_DIR OUTPUT_DIR SCRATCH_DIR NCPU=8 MEM_GB=24`.
 - Gate: public dev set (1M events) must match, < 3 min. Practice board: hidden ~20M events. **Final: fresh ~60M events, 3-min cap per run, median of 3**; the top 5+ are re-timed 5×.
 - Hidden-data feedback is only exit code, OOM flag, and counts of missing/extra/differing rows.
-- Limits: **2 submissions/hour**, ties go to the earlier submission, ~20% machine variance.
+- Limits: **3 submissions/hour** (was 2; can change), a rejected entry still counts, ties go to the earlier submission, ~20% machine variance. See §8 for the form.
 - Board at time of writing: baseline (PySpark) 171.91 s, leader 16.38 s (20M practice).
 - Image build on the scorer has network, **≤ 10 minutes**.
 
@@ -322,7 +322,29 @@ V2 tasks run G1 twice: default chunk size and `SHOPT_CHUNK_BYTES=4096`.
 
 ## 8. Submission protocol and results log
 
-Human only. Before submitting: the exact commit passes G1 + G2, is pushed, and the repo is public. Max 2 per hour; space them out so a failure can be fixed before the next slot.
+Human only.
+
+**The submit form** (track page → Submit) asks for:
+
+| Field | Value |
+|---|---|
+| Public GitHub repository | `https://github.com/aandrx/shoptimizer` |
+| Commit (optional) | **Always fill in the full 40-character SHA.** Left empty, it scores the newest commit on the default branch, which may not be the one you tested. |
+
+**Form rules:**
+- Quota shown as "N of 3 left this hour" (3/hour at last check; "quotas may be reduced at any time").
+- The repo must be **public at submit time** with the `Dockerfile` at the top. It may go private again once that submission is scored.
+- **Push before submitting.** They fetch from GitHub. A rejected entry (unfetchable commit, failed build, failed dev check) still uses one of the hour's slots.
+- They keep a copy of every scored commit, and the final uses that copy.
+
+**Pre-submit checklist** (all on the exact SHA being submitted):
+1. G1 + G2 (§7) pass.
+2. `git push` done; `git ls-remote origin` shows the SHA on a pushed branch.
+3. Repo is public (the URL opens logged out).
+4. Paste the full SHA (`git rev-parse HEAD`) into the form.
+5. Record a row below right away, then update it when the result arrives.
+
+Space submissions out so a failure can be fixed before the next slot.
 
 | When (ET) | Commit | What | Practice time | Result / notes |
 |---|---|---|---|---|
