@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+mod agg;
 mod csv;
 mod output;
 mod people;
