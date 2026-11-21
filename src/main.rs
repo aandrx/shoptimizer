@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 mod agg;
 mod csv;
 mod output;
@@ -21,12 +19,9 @@ fn main() -> ExitCode {
     };
     let t = Instant::now();
     eprintln!("[start] data={} out={}", data.display(), out.display());
-    // T05: call v1::run(&data, &out) instead of writing empty tables.
-    let r = output::write_user_daily(&out.join("user_daily"), &[])
-        .and_then(|_| output::write_campaign_daily(&out.join("campaign_daily"), &[]));
-    match r {
+    match v1::run(&data, &out) {
         Ok(()) => {
-            eprintln!("[phase] write {} ms", t.elapsed().as_millis());
+            eprintln!("[phase] total {}", t.elapsed().as_millis());
             ExitCode::SUCCESS
         }
         Err(e) => {
