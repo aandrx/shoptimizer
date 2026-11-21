@@ -1,0 +1,21 @@
+[package]
+name = "shoptimizer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "shoptimizer"
+path = "src/main.rs"
+
+[dependencies]
+parquet = { version = "60.1.0", default-features = false }
+rayon = "1.12"
+memmap2 = "0.9"
+mimalloc = { version = "0.1", default-features = false }
+hashbrown = "0.17"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
