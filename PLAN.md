@@ -151,6 +151,36 @@ pub fn write_campaign_daily(dir: &Path, rows: &[CampaignDaily]) -> io::Result<()
 
 Data flow (V2): `mmap files → byte-range chunks → parse (parallel) → scatter by hash(event_id) → dedup + validate + late (per bucket) → map user → person, scatter by hash(person) → sort (person, ts) → sessionize + credit/assists against that person's clicks sorted (ts, click_id) → per-thread aggregates → merge → write Parquet`.
 
+### 5a. Optimization playbook (V2)
+
+Mainstream engine techniques, mapped onto this workload. V2 tasks follow this; T13 measures each.
+
+**What does *not* apply.** Predicate/projection pushdown into storage, zone maps, row-group stats and Bloom-filter skipping all need a format with metadata. CSV has none: every byte must be scanned to find row boundaries. Here "pushdown" means doing the least work per field *inside the parser*, not skipping input.
+
+| # | Technique | Applied here | Task |
+|---|---|---|---|
+| O1 | **Fused single pass** (HyPer-style data-centric pipeline) | One loop per chunk: parse → encode → filter → scatter into buckets. No intermediate row tables, each input byte touched once | T08, T10 |
+| O2 | **Morsel-driven parallelism** | Fixed byte-range chunks pulled from a shared queue (rayon), not one file per thread (largest file ≈ 16% of data) | T08 (D9) |
+| O3 | **SIMD scanning** (simdjson / simdcsv) | Find `,` `"` `\n` 32–64 bytes at a time as bitmasks; only 4 physical cores, so per-core parse speed decides the race | T13 |
+| O4 | **Early filtering, bounded by dedup** | *Clicks*: drop at parse time (bad campaign, out of window, empty user/id); they need no dedup. *Events*: dedup comes before validation, so a row that fails validation still takes part in dedup, but carries only `(event_id, ingest_ts, invalid=1)`; its other fields are discarded at parse time | T08, T10 |
+| O5 | **Dictionary encoding at parse** | category → `u8` (20 + `unknown`), campaign → `u16` (≤ 2000 + `organic`), event_type → 2 bits, price → `u32`. `products.csv` / `campaigns.csv` are tiny lookup tables: a lookup at parse, no join | T08 |
+| O6 | **Late materialization** | IDs stay packed `u128` (D6) end to end; strings are rebuilt only when writing Parquet | T09, T12 |
+| O7 | **Compact records** | `ingest_ts` is always whole-second F1 → `u32` seconds from `window_start − 7d`; event `ts` → `i32` ms offset from `window_start` (14-day window < 2^31 ms). Target ≤ 32 B/event (vs ~48): one third less memory traffic on every scatter and sort. Out-of-range values are invalid anyway; keep a flag | T08, T10 |
+| O8 | **Radix partitioning** (DuckDB / HyPer joins) | Scatter into 2^k cache-sized buckets (k ≈ 8–10, per-thread buffers), then hash or sort inside each: dedup by `event_id`, then re-partition by person | T10 (D8) |
+| O9 | **Radix sort** | (person, ts) per bucket as one `u64` key (person index within bucket + ts offset); LSD radix sort, typically 2–4× faster than `sort_unstable` at this size | T11, T13 |
+| O10 | **Partial / pre-aggregation** | `campaign_daily`: fixed per-thread array `[campaign_idx][day]` (≤ 2001 × 14), summed at the end. `user_daily`: rows come out of the per-person walk in order, no hash table | T11 |
+| O11 | **Early read-ahead** | At startup, `madvise(MADV_WILLNEED)` (or `posix_fadvise`) on every mmapped file so the kernel reads ahead while threads parse. Only matters if the scorer's disk is cold (open risk), cheap either way | T08 |
+| O12 | **No allocation in hot loops** | Pre-sized per-thread buckets and buffers, reused across chunks; `mimalloc` | T08–T11 |
+
+**Deliberately not done** (decided; measure in T13 only if profiling points there):
+- **Output compression**: ~7M rows ≈ 150 MB uncompressed; snappy/zstd costs more CPU than the write saves, and the 50 GB space limit is never close.
+- **Parquet dictionary encoding**: may help `channel` / `campaign_id` / `top_category`, but those columns are small. T13 A/B only.
+- **Deferring `ts` parse for duplicate copies**: ~97% of events are unique, so nearly every copy is the kept one; deferring turns one sequential pass into random reads back into the file.
+- **Spilling**: working set ~2–3 GB vs 24 GB. Never spill.
+- **Cross-run caching**: every run is a fresh container on new data; the only fixed cost is container start (hence distroless, D4).
+
+**Expected order of payoff:** O1+O2 (fused, morsel-parallel parse) > O3 (SIMD) > O7+O5 (compact, encoded records) > O9 (radix sort) > O11 (read-ahead, insurance for a cold disk).
+
 ---
 
 ## 6. Tasks
@@ -251,7 +281,7 @@ Each card: **Scope** (files the task may touch), **Depends**, **Do**, **Accept**
 ---
 
 **T08 — Parallel chunked parse** · Scope: `src/v2/read.rs`, `src/v2/mod.rs` · Depends: T05
-- Do: mmap every CSV; split into byte ranges per D9 (each range starts after a `\n` and ends at one; the first range of each file skips the header); parse in parallel with rayon into per-thread `Vec`s of compact records. Use the V1 parsing functions.
+- Do: mmap every CSV; split into byte ranges per D9 (each range starts after a `\n` and ends at one; the first range of each file skips the header); parse in parallel with rayon into per-thread `Vec`s of compact records. Use the V1 parsing functions. Apply §5a O1, O4 (clicks filtered at parse; invalid events reduced to `(event_id, ingest_ts, invalid)`), O5, O7, O11, O12.
 - Accept: G1 run **with `SHOPT_CHUNK_BYTES=4096`** (forces many chunks per file) and with the default; G3.
 - Traps: the header belongs only to byte 0 of each file. A range boundary landing exactly on `\n`. Empty and header-only files.
 
@@ -264,14 +294,14 @@ Each card: **Scope** (files the task may touch), **Depends**, **Do**, **Accept**
 ---
 
 **T10 — Parallel dedup + re-partition by person** · Scope: `src/v2/dedup.rs`, `src/v2/people.rs` · Depends: T08, T09
-- Do: scatter parsed events into 2^k buckets by hash(event_id); per bucket keep the smallest `ingest_ts` copy (malformed lines are already gone), then validate and apply the late rule. Map each surviving event's user → person name (People built on packed IDs), scatter by hash(person). Clicks: validate, map to person, scatter by the same hash. No click dedup (D7).
+- Do: scatter parsed events into 2^k buckets by hash(event_id); per bucket keep the smallest `ingest_ts` copy (malformed lines are already gone), then validate and apply the late rule. Map each surviving event's user → person name (People built on packed IDs), scatter by hash(person). Clicks: validate, map to person, scatter by the same hash. No click dedup (D7). Radix-partition per §5a O8 (per-thread bucket buffers, no locks).
 - Accept: G1 (both chunk sizes); G3.
 - Traps: validation happens **after** choosing the kept copy. Equal `ingest_ts` copies are identical (either is fine).
 
 ---
 
 **T11 — Parallel sessions, attribution, aggregation** · Scope: `src/v2/sessions.rs`, `src/v2/mod.rs` · Depends: T10
-- Do: per person-bucket in parallel: sort events by (person, ts), sort clicks by (person, ts, click_id); sessionize; for each session start, credit = the **first** click of the latest-`ts` group with `ts ≤ start` and `start − ts ≤ 604,800,000`; assists = campaigns with count > 0 in the sliding window `[start − 7d, start]`. Accumulate into per-thread aggregates, merge, write.
+- Do: per person-bucket in parallel: sort events by (person, ts), sort clicks by (person, ts, click_id); sessionize; for each session start, credit = the **first** click of the latest-`ts` group with `ts ≤ start` and `start − ts ≤ 604,800,000`; assists = campaigns with count > 0 in the sliding window `[start − 7d, start]`. Accumulate into per-thread aggregates, merge, write. Use §5a O9 (radix sort on a packed `u64` key) and O10 (fixed `[campaign][day]` arrays).
 - Accept: G1 (both chunk sizes) + G2; G3. Report p20 bench.
 - Traps: the window includes both ends. Equal-`ts` events join the session of the first of them. One click credits many sessions.
 
@@ -288,7 +318,7 @@ Each card: **Scope** (files the task may touch), **Depends**, **Do**, **Accept**
 ---
 
 **T13 — Profile and tune loop** · Scope: `src/**` · Depends: H3
-- Do: `perf record` the binary on `data/p20` natively; attack the top phase. One idea per branch, each measured with `make bench`. Candidate ideas: SIMD/`memchr` field scanning; parse only needed fields; per-thread pre-sized hash tables; radix sort on (person, ts); reuse buffers (zero per-row allocation); `mimalloc`; overlap I/O and parse; drop out-of-window/bad-type rows right after dedup.
+- Do: `perf record` the binary on `data/p20` natively; attack the top phase. One idea per branch, each measured with `make bench`. Candidate ideas, in §5a's payoff order: O3 SIMD field scanning; O7 shrink records further; O9 radix sort if T11 didn't; per-thread pre-sized hash tables; O12 buffer reuse and `mimalloc`; O11 read-ahead; drop out-of-window/bad-type rows right after dedup; then the "deliberately not done" items only if the profile points there.
 - Accept per idea: G1 + G3 (≥ 3% median win on p20 or reverted).
 
 ---

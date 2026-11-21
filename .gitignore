@@ -11,3 +11,4 @@ __pycache__/
 .tools/
 .venv
 .tools
+.claude/
