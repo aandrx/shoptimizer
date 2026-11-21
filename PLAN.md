@@ -21,7 +21,7 @@ This file is written so one orchestrator session can hand each task in §6 to a 
 2. One task = one branch `t<NN>-<slug>` (use a git worktree for parallel tasks). Commit locally. Only the orchestrator merges to `main`, and only after the task's acceptance passes on the merged result.
 3. A task is **done** only when every acceptance command passes. "Should work" is not done.
 4. Every change to pipeline code must pass gate **G1** (§7). Performance tasks must also pass **G3**.
-5. **Sandbox:** agents cannot reach GitHub (no push, pull or fetch) and cannot use `sudo`. Hand those to the human.
+5. **Sandbox:** GitHub access (push, pull, fetch) depends on the machine: some agent sandboxes have it, some don't. Check with `git fetch` before assuming either way. Agents never use `sudo`. Hand those to the human.
 6. Do not relitigate §4 decisions. If a task seems to need a different decision, stop and ask the orchestrator.
 7. The pipeline writes logs to **stderr only**. Stdout stays effectively empty (the scorer caps it at 50 MB).
 8. Never commit `data/`, `.tools/`, `.venv/`, `target/`, `out*/`, or generated datasets. The repo must stay < 50 MB.
@@ -49,7 +49,7 @@ Read messy CSVs from `/data`, write two Parquet tables to `/output/user_daily/` 
 |---|---|---|
 | `rules.md` | The spec | given, frozen |
 | `fixtures/` | 36 edge cases: `input/` + `expected/*.csv` | given, frozen |
-| `reference/reference.py` | Literal Python implementation. 36/36 fixtures, matches `dev-answer`. ~13 s per 1M events | done, frozen |
+| `reference/reference.py` | Literal Python implementation. 36/36 fixtures, matches `dev-answer`. ~13 s and **~740 MB peak RSS per 1M events** (measured) | done, frozen |
 | `scripts/run_fixtures.py` | Runs `CMD` on every fixture, exact diff | done |
 | `scripts/compare.py` | Exact order-insensitive diff of two output folders | done |
 | `scripts/diff_seeds.py` | Runs candidate + reference on many generator seeds, diffs (cached in `data/`) | done |
@@ -93,12 +93,13 @@ CPUS=8 MEM=24g scripts/docker_run.sh data/p20 out-p20   # timed practice-size ru
 | D1 | **Rust, one binary.** No DuckDB/Polars/Spark/Python at run time. | The work is CSV parsing whose dialect those readers don't follow; Python/JVM startup is timed. |
 | D2 | **V1 first:** simple, single-threaded, `&[u8]`/`Vec<u8>` IDs, correct. Submit it. **V2** adds speed behind the same tests. | Bank a correct score early (ties go to the earlier submission). V1 stays as the fallback path. |
 | D3 | Dependency allow-list: `parquet` (`default-features = false`, no arrow, uncompressed), `rayon`, `memmap2`, `mimalloc`, `hashbrown`. Nothing else without approval. | Scorer build ≤ 10 min. |
-| D4 | Docker: builder `rust:1.97-bookworm` (matches local rustc 1.97) with a dependency-cache layer; runtime `gcr.io/distroless/cc-debian12`; `ENTRYPOINT ["/shoptimizer"]`. | Small image, fast start. |
+| D4 | Docker: builder `rust:1.97-bookworm` (matches local rustc 1.97) with a dependency-cache layer; runtime `gcr.io/distroless/cc-debian12`; `ENTRYPOINT ["/shoptimizer"]`. | Small image, fast start. Note: distroless has no `chmod`, so `scripts/docker_run.sh`'s `release()` cleanup (`--entrypoint chmod "$IMAGE"`) silently fails; see T01. |
 | D5 | Build flags in `.cargo/config.toml`: `target-cpu=x86-64-v3`, plus release profile `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`. `x86-64-v4` only via the T13 A/B. | AVX-512 downclocks Cascade Lake. Local Zen 4 has no penalty, so local tests flatter v4. |
 | D6 | **Packed IDs (V2):** `u128`, ID bytes big-endian from bit 127 down, zero-padded, **length in the lowest byte**. Integer `<` then equals byte-wise order. IDs > 15 bytes: the whole run falls back to the V1 path (a flag set during parse). | No shared interning table. Measured: all IDs ≤ 9 bytes in generated data, so the fallback is for safety only. |
 | D7 | **No click dedup.** Copies are identical, so they can't change credit or assists. Assist window counts only need `> 0`. | Saves a hash pass over ~15M clicks. |
 | D8 | **Dedup events globally first** (partition by `event_id` hash), **then** re-partition by person. | The kept copy may name a different user (E4). |
 | D9 | Parallel parse splits files into **fixed byte ranges aligned to `\n`**, size from env `SHOPT_CHUNK_BYTES` (default 32 MiB). | File sizes are skewed (one file ≈ 16% of the data). The env var lets small tests exercise many chunks. |
+| D11 | **Oracle by dataset size.** `reference/reference.py` is the oracle up to ~2M events. For p20 / p60, the oracle is the **V1 binary** (T05), once it has passed G1 on every seed sweep. | The Python reference needs ~15 GB RSS at 20M and ~45 GB at 60M (measured 740 MB per 1M): it cannot run on a 16 GB laptop or produce p60 answers at all. |
 | D10 | Parquet: `INT64` for counts, `INT32` + logical `DATE` for `day`, `BYTE_ARRAY` + `String` for strings, `top_category` nullable, no compression. | Matches the checker. Cheap to write. |
 
 ---
@@ -179,7 +180,7 @@ Each card: **Scope** (files the task may touch), **Depends**, **Do**, **Accept**
 
 **H1 — Human setup** · Depends: — 
 - `sudo pacman -S docker-buildx`. Confirm `docker buildx version`.
-- Make the GitHub repo **public** before the first submission (Settings → Danger Zone). Fill in `TEAM.md` (team name, members, engine: Rust).
+- Make the GitHub repo **public** before the first submission (Settings → Danger Zone). **Currently PRIVATE** (checked with `gh repo view`): H2 is blocked until this is done. Fill in `TEAM.md` (team name, members, engine: Rust).
 - Accept: `docker buildx version` prints a version; the repo URL opens logged out.
 
 ---
@@ -198,6 +199,7 @@ Each card: **Scope** (files the task may touch), **Depends**, **Do**, **Accept**
   - `make fixtures CAND=target/release/shoptimizer`: cases whose expected tables are empty (E5, E13) pass; every other case fails only on missing rows, not on schema.
   - `make build && make docker-fixtures`: same result through the image.
   - Cold `docker build --no-cache` takes < 4 min locally. Report the time and image size.
+- Also: in `scripts/docker_run.sh`, change `release()` to run `chmod` from a tiny image that has it (e.g. `busybox:1.36`) instead of `--entrypoint chmod "$IMAGE"`, because the distroless runtime has no `chmod`. Without this, uid-1000 files can be left behind in `out/` on Linux hosts whose user is not uid 1000.
 - Traps: `day` must be a Parquet DATE (`INT32` + Date logical type), not a string or timestamp. Exact column names, no extras.
 
 ---
@@ -243,7 +245,7 @@ Each card: **Scope** (files the task may touch), **Depends**, **Do**, **Accept**
 ---
 
 **T07 — Bench tooling** · Scope: `scripts/bench.sh` (new), `Makefile` (add `bench` target) · Depends: T00
-- Do: `scripts/bench.sh DATA [RUNS=3]` runs the Docker image via `scripts/docker_run.sh` on `DATA` with `CPUS=8 MEM=24g`, prints each wall time and the median, and checks the output against a cached reference output for that dataset (generate it once with the reference; ~4 min at 20M).
+- Do: `scripts/bench.sh DATA [RUNS=3]` runs the Docker image via `scripts/docker_run.sh` on `DATA` with `CPUS=8 MEM=24g`, prints each wall time and the median, and checks the output against a cached oracle output for that dataset. Per **D11**, the oracle for p20/p60 is the **V1 binary** run natively (`target/release/shoptimizer` built from the V1-tagged commit, or a `--v1` flag), not the Python reference, which would need ~15 GB RSS at 20M.
 - Accept: `make bench DATA=data/p20` prints 3 times + median and `MATCH`.
 
 ---
@@ -293,12 +295,13 @@ Each card: **Scope** (files the task may touch), **Depends**, **Do**, **Accept**
 
 **T14 — Build-flag A/B** · Scope: `.cargo/config.toml`, `Cargo.toml` · Depends: H3
 - Do: produce two commits, `x86-64-v3` vs `x86-64-v4` (and mimalloc on/off if not already settled). The human submits both and keeps the faster (board variance ~20%: only trust gaps larger than that, or repeat).
+- **Low priority.** With ~20% board noise and 2 submissions/hour, one A/B costs two slots and will usually be inconclusive. Keep `x86-64-v3` unless spare slots remain after T13.
 - Accept: both pass G1 + G2.
 
 ---
 
 **T15 — 60M robustness** · Scope: none unless a fix is needed · Depends: T11
-- Do: `make bench DATA=data/p60` (generate the reference output once). Measure peak RSS (`/usr/bin/time -v` natively, or `docker stats`).
+- Do: `make bench DATA=data/p60` (oracle output generated once with the **V1 binary**, per D11; the Python reference cannot run at 60M). Measure peak RSS (`/usr/bin/time -v` natively, or `docker stats`).
 - Accept: `MATCH`; median < 30 s locally; **peak RSS < 12 GB**; no writes outside `/output` and `/scratch`.
 
 ---
@@ -380,3 +383,6 @@ Human only. Before submitting: the exact commit passes G1 + G2, is pushed, and t
 | `parquet` crate build time on the scorer | T01 reports cold build time; fall back to a hand-written writer if > 4 min locally |
 | v3 vs v4 | T14 A/B on the board |
 | Correctness on unseen seeds | G1 seed sweeps; widen `SEEDS` before every submission |
+| No oracle at 20M/60M from the Python reference | D11: V1 is the large-set oracle, trusted only after full G1 sweeps |
+| Repo private | H1: must be public before H2 |
+| Schedule | Critical path to the first submission: T01 → (T02, T03, T04, T06 in parallel) → T05 → H2. Start T01 immediately; everything V2 waits on it |
