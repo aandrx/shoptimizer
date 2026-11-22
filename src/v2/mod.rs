@@ -28,8 +28,9 @@ use crate::ts::Window;
 use sessions::{Acc, ASSISTED, PURCHASING, REVENUE, SESSIONS};
 use types::{Ck, Ctx, Ev, EvRaw, Parsed, PURCHASE, VALID};
 
+/// Phase log line; `SHOPT_IO_STATS=1` adds fault and RSS fields (S3-7).
 fn phase(name: &str, started: Instant) {
-    eprintln!("[phase] {name} {}ms", started.elapsed().as_millis());
+    crate::iostats::log_phase(name, started);
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
