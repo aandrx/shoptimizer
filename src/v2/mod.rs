@@ -4,6 +4,7 @@
 //! P3 sessions -> P4 write. Falls back to [`crate::v1::run`] whenever the input
 //! doesn't fit V2's compact encoding (D6, D13).
 
+pub mod dedup;
 pub mod parse;
 pub mod people;
 pub mod scan;
@@ -18,8 +19,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use hashbrown::hash_map::Entry;
-use hashbrown::HashMap;
 use rayon::prelude::*;
 
 use crate::agg::ORGANIC;
@@ -28,7 +27,7 @@ use crate::output::{self, CampaignDaily, UserDaily};
 use crate::ts::Window;
 
 use sessions::{Acc, ASSISTED, PURCHASING, REVENUE, SESSIONS};
-use types::{Ck, Ctx, Ev, EvRaw, Parsed, PURCHASE, VALID};
+use types::{Ck, Ctx, Ev, EvRaw, Parsed, Thin};
 
 /// Phase log line; `SHOPT_IO_STATS=1` adds fault and RSS fields (S3-7).
 fn phase(name: &str, started: Instant) {
@@ -115,6 +114,83 @@ where
     parts.into_inner().unwrap()
 }
 
+/// Per-worker P1 records for the thin path: parse-ordered `EvRaw`s plus the
+/// dedup tuples bucketed by `SHOPT_DEDUP_BITS`.
+struct ThinPart {
+    recs: Vec<EvRaw>,
+    thin: Vec<Vec<Thin>>,
+}
+
+/// P1 event output, shaped by `SHOPT_DEDUP`.
+enum EventParts {
+    Wide(Vec<Vec<Vec<EvRaw>>>),
+    Thin(Vec<ThinPart>),
+}
+
+/// Thin P1: every worker keeps its records in parse order and appends a
+/// [`Thin`] tuple to its own dedup bucket set. No event scatter.
+fn scatter_thin<F>(
+    chunks: &[&[u8]],
+    nd: usize,
+    rec_cap: usize,
+    thin_cap: usize,
+    overflow: &AtomicBool,
+    bits: u32,
+    parse: F,
+) -> Vec<ThinPart>
+where
+    F: Fn(&[u8]) -> Parsed<EvRaw> + Sync,
+{
+    let workers = rayon::current_num_threads().max(1);
+    if workers > dedup::MAX_WORKERS {
+        overflow.store(true, Ordering::Relaxed);
+        return Vec::new();
+    }
+    let next = AtomicUsize::new(0);
+    let next_worker = AtomicUsize::new(0);
+    let parts: Mutex<Vec<Option<ThinPart>>> = Mutex::new((0..workers).map(|_| None).collect());
+    rayon::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|_| {
+                let worker = next_worker.fetch_add(1, Ordering::Relaxed);
+                let mut recs = Vec::with_capacity(rec_cap);
+                let mut thin: Vec<Vec<Thin>> = (0..nd)
+                    .map(|_| Vec::with_capacity(thin_cap))
+                    .collect();
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(chunk) = chunks.get(i) else { break };
+                    for line in scan::lines(chunk) {
+                        match parse(line) {
+                            Parsed::Rec(r) => {
+                                let offset = recs.len();
+                                match dedup::key(r.ingest_s, worker, offset) {
+                                    Some(key) => thin[id::bucket(r.id, bits)].push(Thin {
+                                        id_lo: r.id as u64,
+                                        id_hi: (r.id >> 64) as u64,
+                                        key,
+                                    }),
+                                    None => overflow.store(true, Ordering::Relaxed),
+                                }
+                                recs.push(r);
+                            }
+                            Parsed::Skip => {}
+                            Parsed::Overflow => overflow.store(true, Ordering::Relaxed),
+                        }
+                    }
+                }
+                parts.lock().unwrap()[worker] = Some(ThinPart { recs, thin });
+            });
+        }
+    });
+    parts
+        .into_inner()
+        .unwrap()
+        .into_iter()
+        .map(|p| p.unwrap())
+        .collect()
+}
+
 /// Runs V2 and drops everything normally when it returns.
 ///
 /// This is the entry point for tests and any caller that wants teardown to run;
@@ -155,8 +231,25 @@ fn run_v2(data: &Path, out: &Path, on_success: impl FnOnce()) -> io::Result<bool
     let click_maps = scan::map_dir(&data.join("clicks"))?;
     let link_maps = scan::map_dir(&data.join("links"))?;
     let chunk = env_usize("SHOPT_CHUNK_BYTES", 32 << 20);
-    let bits = env_usize("SHOPT_BUCKET_BITS", 8).min(16) as u32;
-    let nb = 1usize << bits;
+    // B1 knobs: explicit per-side settings win; the legacy shorthand sets both.
+    let shorthand = std::env::var("SHOPT_BUCKET_BITS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    let dedup_bits = std::env::var("SHOPT_DEDUP_BITS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .or(shorthand)
+        .unwrap_or(11)
+        .min(16) as u32;
+    let person_bits = std::env::var("SHOPT_PERSON_BITS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .or(shorthand)
+        .unwrap_or(8)
+        .min(16) as u32;
+    let thin = std::env::var("SHOPT_DEDUP").as_deref() != Ok("wide");
+    let nd = 1usize << dedup_bits;
+    let nb = 1usize << person_bits;
     phase("open", started);
 
     // ---- P1: parse + scatter. Events don't need the person map, so the links
@@ -165,25 +258,42 @@ fn run_v2(data: &Path, out: &Path, on_success: impl FnOnce()) -> io::Result<bool
     let overflow = AtomicBool::new(false);
     let link_chunks = scan::chunks(&link_maps, chunk);
     let ev_chunks = scan::chunks(&event_maps, chunk);
-    let (people, ev_parts) = rayon::join(
+    let (people, events) = rayon::join(
         || people::build(&link_chunks),
         || {
             let workers = rayon::current_num_threads().max(1);
             let bytes: usize = ev_chunks.iter().map(|c| c.len()).sum();
-            let cap = prealloc_cap(bytes, 70, workers, nb);
-            scatter(&ev_chunks, nb, cap, &overflow, |line| {
-                match parse::event(line, &ctx) {
-                    Parsed::Rec(r) => Parsed::Rec((id::bucket(r.id, bits), r)),
-                    Parsed::Skip => Parsed::Skip,
-                    Parsed::Overflow => Parsed::Overflow,
-                }
-            })
+            if thin {
+                let rec_cap = prealloc_cap(bytes, 70, workers, 1);
+                let thin_cap = prealloc_cap(bytes, 70, workers, nd);
+                EventParts::Thin(scatter_thin(
+                    &ev_chunks,
+                    nd,
+                    rec_cap,
+                    thin_cap,
+                    &overflow,
+                    dedup_bits,
+                    |line| parse::event(line, &ctx),
+                ))
+            } else {
+                let cap = prealloc_cap(bytes, 70, workers, nd);
+                EventParts::Wide(scatter(&ev_chunks, nd, cap, &overflow, |line| {
+                    match parse::event(line, &ctx) {
+                        Parsed::Rec(r) => Parsed::Rec((id::bucket(r.id, dedup_bits), r)),
+                        Parsed::Skip => Parsed::Skip,
+                        Parsed::Overflow => Parsed::Overflow,
+                    }
+                }))
+            }
         },
     );
     let Some(people) = people else {
         return Ok(false);
     };
     phase("links+events", started);
+    if overflow.load(Ordering::Relaxed) {
+        return Ok(false);
+    }
     let started = Instant::now();
     let ck_chunks = scan::chunks(&click_maps, chunk);
     let ck_parts: Vec<Vec<Vec<Ck>>> = {
@@ -194,7 +304,7 @@ fn run_v2(data: &Path, out: &Path, on_success: impl FnOnce()) -> io::Result<bool
             match parse::click(line, &ctx) {
                 Parsed::Rec((user, mut ck)) => {
                     ck.person = people.person(user);
-                    Parsed::Rec((id::bucket(ck.person, bits), ck))
+                    Parsed::Rec((id::bucket(ck.person, person_bits), ck))
                 }
                 Parsed::Skip => Parsed::Skip,
                 Parsed::Overflow => Parsed::Overflow,
@@ -206,60 +316,24 @@ fn run_v2(data: &Path, out: &Path, on_success: impl FnOnce()) -> io::Result<bool
     }
     phase("clicks", started);
 
-    // ---- P2: dedup per event bucket, then re-partition by person
+    // ---- P2: dedup, then re-partition by person. `wide` keeps the original
+    // reducer; `thin` uses the B1 exact-key tuples plus loser bitmaps.
     let started = Instant::now();
-    let ev_out: Vec<Vec<Vec<Ev>>> = (0..nb)
-        .into_par_iter()
-        .map(|b| {
-            let total: usize = ev_parts.iter().map(|p| p[b].len()).sum();
-            let mut kept: HashMap<u128, EvRaw> = HashMap::with_capacity(total);
-            for part in &ev_parts {
-                for r in &part[b] {
-                    match kept.entry(r.id) {
-                        Entry::Occupied(mut o) => {
-                            // Equal ingest_ts copies are identical: either is fine.
-                            if r.ingest_s < o.get().ingest_s {
-                                o.insert(*r);
-                            }
-                        }
-                        Entry::Vacant(v) => {
-                            v.insert(*r);
-                        }
-                    }
-                }
-            }
-            // Count VALID survivors per destination person bucket, so each output
-            // Vec gets its exact capacity and never doubles (S3-5).
-            //
-            // The dedup map's `user` field is dead after this point, so each
-            // survivor's person is written back into it; the fill pass then needs
-            // no second `people.person` lookup.
-            let mut counts = vec![0usize; nb];
-            for r in kept.values_mut() {
-                if r.flags & VALID == 0 {
-                    continue;
-                }
-                r.user = people.person(r.user);
-                counts[id::bucket(r.user, bits)] += 1;
-            }
-            let mut out: Vec<Vec<Ev>> = counts.into_iter().map(Vec::with_capacity).collect();
-            for r in kept.values() {
-                if r.flags & VALID == 0 {
-                    continue;
-                }
-                out[id::bucket(r.user, bits)].push(Ev {
-                    person: r.user,
-                    ts: r.ts,
-                    price: r.price,
-                    cat: r.cat,
-                    purchase: r.flags & PURCHASE != 0,
-                });
-            }
+    let ev_out = match events {
+        EventParts::Wide(ev_parts) => {
+            let out = dedup::dedup_wide(&ev_parts, &people, dedup_bits, person_bits);
+            // S3-3: free the parse buffers in the background.
+            std::thread::spawn(move || drop(ev_parts));
             out
-        })
-        .collect();
-    // S3-3: free the parse buffers in the background instead of on the critical path.
-    std::thread::spawn(move || drop(ev_parts));
+        }
+        EventParts::Thin(parts) => {
+            let (recs, thin): (Vec<_>, Vec<_>) = parts
+                .into_iter()
+                .map(|p| (p.recs, p.thin))
+                .unzip();
+            dedup::dedup_thin(recs, thin, &people, nd, person_bits)
+        }
+    };
     phase("dedup", started);
 
     // ---- P3: sessions per person bucket

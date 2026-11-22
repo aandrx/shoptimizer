@@ -30,6 +30,23 @@ pub struct EvRaw {
     pub flags: u8,
 }
 
+/// One dedup tuple (B1): the packed event ID plus the packed
+/// `(ingest_s, worker, parse offset)` key. 24 bytes, `#[repr(C)]`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Thin {
+    pub id_lo: u64,
+    pub id_hi: u64,
+    pub key: u64,
+}
+
+impl Thin {
+    #[inline]
+    pub fn id(&self) -> u128 {
+        ((self.id_hi as u128) << 64) | self.id_lo as u128
+    }
+}
+
 /// A surviving event, owned by its person.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ev {
