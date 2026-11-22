@@ -78,10 +78,16 @@ pub fn event(line: &[u8], ctx: &Ctx) -> Parsed<EvRaw> {
     let Some(user) = id::pack(user) else {
         return Parsed::Overflow;
     };
-    // A product too long to pack can't be in products.csv (Ctx::build checks).
-    let cat = id::pack(product)
-        .and_then(|p| ctx.products.get(&p).copied())
-        .unwrap_or(ctx.unknown_cat);
+    // Categories only matter for purchases (`sessions.rs` reads `Ev.cat` under
+    // `if ev.purchase`), so skip the lookup otherwise. A product too long to pack
+    // can't be in products.csv (Ctx::build checks).
+    let cat = if purchase {
+        id::pack(product)
+            .and_then(|p| ctx.products.get(&p).copied())
+            .unwrap_or(ctx.unknown_cat)
+    } else {
+        ctx.unknown_cat
+    };
     rec.user = user;
     rec.ts = (t - ctx.window.start) as u32;
     rec.price = price as u32;
@@ -192,10 +198,41 @@ mod tests {
         assert_eq!(r.price, 500);
         assert_eq!(r.flags, VALID | PURCHASE);
         assert_eq!(c.categories[r.cat as usize], b"unknown");
-        let r = ev("e1,u1,2026-10-03T10:00:00Z,2026-10-03T10:01:00Z,view,p2,").unwrap();
+        let r = ev("e1,u1,2026-10-03T10:00:00Z,2026-10-03T10:01:00Z,purchase,p2,500").unwrap();
         assert_eq!(c.categories[r.cat as usize], b"books");
+        // Non-purchases don't look the product up; `cat` is unused for them.
+        let r = ev("e1,u1,2026-10-03T10:00:00Z,2026-10-03T10:01:00Z,view,p2,").unwrap();
+        assert_eq!(r.cat, c.unknown_cat);
         // Categories are sorted byte-wise.
         assert_eq!(c.categories, vec![&b"books"[..], b"shoes", b"unknown"]);
+    }
+
+    #[test]
+    fn category_only_for_purchases() {
+        let c = ctx();
+        // A view with an unknown product is still valid; its category is not read.
+        for kind in ["view", "cart"] {
+            let line = format!("e1,u1,2026-10-03T10:00:00Z,2026-10-03T10:01:00Z,{kind},p9,");
+            let r = ev(&line).unwrap();
+            assert_ne!(r.flags & VALID, 0);
+            assert_eq!(r.cat, c.unknown_cat);
+            // A known product is not looked up either, so the record stays the same.
+            let known = format!("e1,u1,2026-10-03T10:00:00Z,2026-10-03T10:01:00Z,{kind},p2,");
+            assert_eq!(ev(&known).unwrap().cat, c.unknown_cat);
+        }
+        // Purchases get the known category, or `unknown` when the product is absent.
+        let r = ev("e1,u1,2026-10-03T10:00:00Z,2026-10-03T10:01:00Z,purchase,p2,500").unwrap();
+        assert_ne!(r.flags & VALID, 0);
+        assert_eq!(c.categories[r.cat as usize], b"books");
+        let r = ev("e1,u1,2026-10-03T10:00:00Z,2026-10-03T10:01:00Z,purchase,p9,500").unwrap();
+        assert_ne!(r.flags & VALID, 0);
+        assert_eq!(c.categories[r.cat as usize], b"unknown");
+        assert_eq!(r.cat, c.unknown_cat);
+        // E13: an empty product is still invalid for every event type.
+        for kind in ["view", "cart", "purchase"] {
+            let line = format!("e1,u1,2026-10-03T10:00:00Z,2026-10-03T10:01:00Z,{kind},,500");
+            assert!(!valid(&line));
+        }
     }
 
     fn ck(line: &str) -> Option<Ck> {
