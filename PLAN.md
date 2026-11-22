@@ -201,6 +201,7 @@ Mainstream engine techniques, mapped onto this workload. V2 tasks follow this; T
 | V1 merge | Two V1s were built in parallel (PR #1, and one on `main`). Both passed G1, with identical output on p20. The merge keeps **PR #1's code** (36 s vs 50 s at 20M; 50 vs 33 unit tests; it's the submitted SHA). The other V1 stays in history (`ce9edff`). |
 | T20–T26 (V2.0) | Implemented on branch `v2`. **p20: ~2.6–2.8 s on 4 cores × 2 threads locally** (`NCPU=8 taskset -c 0-3,8-11`), vs V1 36 s. G1 passes at default, `SHOPT_CHUNK_BYTES=4096`, and `SHOPT_BUCKET_BITS=1 SHOPT_CHUNK_BYTES=100`; G4 `MATCH` vs V1 on p20; 2M seeds 41–43 match; forced V1 fallback (16-byte ID) matches the reference. Phases at p20: links+events parse 1.1 s, clicks 0.26 s, dedup 0.65 s, sessions 0.4 s, write 0.12 s. Peak RSS 5.5 GB (incl. 1.8 GB mapped input). `SHOPT_BUCKET_BITS` 8 vs 10 and 8 vs 32 MiB chunks: no measurable difference. |
 | T07–T12 | **Superseded** by the Submission #2 cards below (T20–T28). T13–T15 still apply after #2. |
+| Pass 1 (S3-0 to S3-7) | Merged up to `e6f1279`. **#3 scored 2.51 s on hidden 20M** (local 2.27 s, so scorer ≈ 1.1× local still holds). S3-8 (huge-page A/B) has no commit or record. 60M, measured Sat 20:15 ET, warm cache: **7.77 s local**. Phases: links+events 2.81 s, clicks 0.53 s, dedup **2.71 s (4.0× of 20M)**, sessions 1.41 s, write 0.30 s. Peak anon 7.4 GB (≤ 10 GB ✓), VmHWM 12.5 GB. A cold first run took 11.4 s. S3-9's other checks (self-checks, 5M seeds) aren't recorded. |
 
 ### Where V1's time goes (20M, local, single thread)
 
@@ -461,9 +462,35 @@ Wave A (parallel):  S3-0 bench ─┐
 
 ---
 
+### Round 2: research, then Pass 2′ (Sat night → Sun 09:00 freeze)
+
+**Why:** #3 is 2.51 s on 20M, but the final is 60M, where we run **~7.8 s locally (~8.5–9 s on the scorer)**, and dedup scales worse than linearly. Pass 2 below was sized from 20M data. Round 2 re-checks it at 60M, and looks for bigger architectural cuts (a global atomic dedup winner table, a full AVX2 scanner, fewer bytes moved) before we spend the night building. The practice leader (0.27 s) is still most likely dataset shortcuts (§9). The `roofline` track will say how close an honest pipeline can get.
+
+**Brief:** `research/perf2/README.md`. Two halves in parallel: a pi fan-out (one researcher per track; the track count comes from the 60M profile, not fixed) and /deep-research in the synthesis session. Output goes to `research/perf2/`. Every report ends with a ready-to-build card and says whether it fits before the freeze.
+
+**Schedule (ET, times are latest-allowed):**
+
+| By | Step | Who | Exit criterion |
+|---|---|---|---|
+| Sat 22:15 | **R2-0** 60M profile (serial) + **R2-1** fan-out + /deep-research | pi orchestrator; synthesis session | `research/perf2/00-profile.md`, `INDEX.md`, one report per track, `deep-research.md` |
+| Sat 22:45 | **R2-2** synthesis → `research/perf2/SYNTHESIS.md` + rewrite of the Pass 2 cards below as **Pass 2′** | synthesis session | Each Pass 2 card is kept, changed or replaced. New cards are in §6 format, with a dependency graph and waves. |
+| Sun 04:30 | **Pass 2′ build** (implementer session, card by card, gates as in "Rules for both passes") | implementer | Every card merged with G1 (all configs) + G4 + bench |
+| Sun 05:30 | **S4-5** 60M check + G2 Docker | implementer + human | Anon peak ≤ 10 GB, 5M seeds 51–53 match, 60M time recorded |
+| Sun 06:00 | **H7** submit #4 | human | Recorded in §8 |
+| Sun 08:30 | Fix-only buffer. Optionally one small extra card if #4 is clean. | | |
+| Sun 09:00 | **H4** freeze | human | |
+
+**Allowed while research runs:** implement S4-1 and S4-2 (no benchmarks; G1 only), because every round-1 source endorses them. If the synthesis replaces dedup with a global winner table, S4-1's dedup side may be dropped, but its person-side counted scatter still applies. Don't start S4-3 or S4-4 before the synthesis.
+
+**Decision rules for the synthesis:**
+- Rank by ms saved **at 60M** per hour, not at 20M.
+- A design that removes a whole scatter or phase beats tuning that phase, if it fits in ≤ 6 h with its tests.
+- Nothing ships that lacks an exact fallback for rows the fast path rejects (D11, rule 3 of the brief).
+- Keep total Pass 2′ effort ≤ 9 h of implementer time. Anything bigger is split, and only its first half is built.
+
 ### Pass 2: Submission #4 (structural, ~10–15 h, target ≈ another 1–1.8 s at 60M)
 
-Start only after #3 is merged and scored. Re-profile first (S4-0). If the profile has shifted, re-rank before building.
+**Superseded by Pass 2′ once R2-2 lands.** Until then these cards stand, but only S4-1 and S4-2 may start (see Round 2). S4-0's profile is now R2-0 (at 60M, in `research/perf2/00-profile.md`).
 
 ```
 S4-0 profile ── S4-1 counted scatter ── S4-2 split bits ──┬── S4-3 compact dedup ──┐
@@ -574,6 +601,8 @@ Space submissions out so a failure can be fixed before the next slot.
 | When (ET) | Commit | What | Practice time | Result / notes |
 |---|---|---|---|---|
 | Sat Nov 21 | `2d9b48067e9f4909dd9f426effa71fbcfd9c20b5` | V1, single-threaded | **40.95 s** | Accepted: exact match on hidden 20M. Local native 36.2 s, so scorer ≈ 1.13× local. |
+| Sat Nov 21 | V2.0 `bf0d6d5…` (#2) | V2.0 parallel pipeline | not recorded | |
+| Sat Nov 21 ~20:00 | `e6f1279…` (HEAD at submit time; **confirm the full SHA**) | #3, Pass 1 (S3-0 to S3-7) | **2.5088 s** | Accepted. Local p20 2.27 s, so ≈ 1.1×. Leader at the time: 0.2716 s. |
 | | | | | |
 
 ---
@@ -590,7 +619,8 @@ Space submissions out so a failure can be fixed before the next slot.
 | Largest file | | 287 MB (~16% of data) | |
 | Parallel read, page-cached | | 0.1–0.2 s | |
 | Max ID length | 9 (product ≤ 6) | 9 (product ≤ 6) | |
-| `user_daily` rows | 117,038 | | ~7M |
+| `user_daily` rows | 117,038 | 2,242,393 | ~7M |
+| V2 after Pass 1, warm, 4c×2t | | 2.27 s | **7.77 s measured** (dedup 2.71 s; peak anon 7.4 GB) |
 
 ### Time budget, 60M on 8 cores, page-cached
 
