@@ -16,7 +16,7 @@ mod v2;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::env;
-use std::io;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
@@ -240,9 +240,22 @@ fn run() -> io::Result<()> {
             .filter(|&n| n > 0)
             .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, usize::from));
         let _ = rayon::ThreadPoolBuilder::new().num_threads(threads).build_global();
-        v2::run(&data, &out)?;
+        // S3-3: exit from this completion hook, while V2 still owns `acc`, the
+        // mmaps and the lookup maps. Returning to `main` would drop all of them
+        // first, paying that teardown on the critical path. The hook runs after
+        // both Parquet writers returned (files closed), and stderr is flushed
+        // before the process exits so no log line is lost.
+        v2::run_with(&data, &out, || {
+            phase("total", started);
+            iostats::log_peak();
+            let _ = io::stderr().flush();
+            std::process::exit(0);
+        })?;
+        // Only the V1 fallback (and any caller whose hook returns) gets here; the
+        // success hook above never returns, so this line is not a duplicate.
         phase("total", started);
     }
+    // V1 and the V1 fallback reach this; successful V2 exits from the hook above.
     iostats::log_peak();
     Ok(())
 }
