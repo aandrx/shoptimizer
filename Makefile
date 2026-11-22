@@ -7,6 +7,8 @@ DEV     ?= data/dev
 DATA    ?= data/dev
 SEEDS   ?= 2-30
 RUNS    ?= 3
+# Comparison target for bench; empty means the default, $(DATA).v1out.
+REF     ?=
 # The command under test; override with CAND="target/release/shoptimizer" once the Rust pipeline exists.
 CAND    ?= $(PY) reference/reference.py
 # `bench` defaults to the built binary, but honours an explicit CAND. `oracle` always uses
@@ -53,5 +55,6 @@ oracle:
 	DATA="$(DATA)" scripts/bench.sh oracle
 
 ## Bench CAND RUNS times on $(DATA) in out-bench/, print median wall + peak RSS, then diff
+## against $(DATA).v1out, or against $(REF) when REF names a directory.
 bench:
-	PY="$(PY)" DATA="$(DATA)" RUNS="$(RUNS)" CAND="$(BENCH_CAND)" scripts/bench.sh bench
+	PY="$(PY)" REF="$(REF)" DATA="$(DATA)" RUNS="$(RUNS)" CAND="$(BENCH_CAND)" scripts/bench.sh bench

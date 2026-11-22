@@ -4,6 +4,11 @@
 #   scripts/bench.sh oracle   # SHOPT_ENGINE=v1 target/release/shoptimizer DATA -> DATA.v1out (once)
 #   scripts/bench.sh bench    # CAND RUNS times in out-bench/, median + peak RSS, then diff
 #
+# The bench compares against $DATA.v1out unless REF names another output
+# directory (REF=data/p60.ref for the 60M baseline), and it holds
+# $ROOT/.bench.lock for the timed runs and the comparison, so a second bench
+# waits instead of overwriting out-bench under the first one.
+#
 # Bench output is always <repo>/out-bench/. It is deleted only when it holds
 # candidate output: user_daily/ and campaign_daily/ with regular files and
 # nothing else. A symlink or a foreign entry makes the bench refuse to run.
@@ -17,6 +22,9 @@ cd "$ROOT"
 
 DATA=${DATA:-data/dev}
 DATA=${DATA%/}
+# Empty REF means the default comparison target, $DATA.v1out.
+REF=${REF:-}
+REF=${REF%/}
 RUNS=${RUNS:-3}
 PY=${PY:-.venv/bin/python}
 CAND=${CAND:-target/release/shoptimizer}
@@ -81,19 +89,33 @@ require_pinned_cpus() {
 
 # Never let out-bench or the oracle's temporary folder touch the input or the oracle.
 guard_paths() {
-    local out_abs data_abs oracle_abs
+    local out_abs data_abs oracle_abs oracle=${REF:-$DATA.v1out}
     out_abs=$(realpath -m -- "$BENCH_OUT")
     data_abs=$(realpath -m -- "$DATA")
-    oracle_abs=$(realpath -m -- "$DATA.v1out")
+    oracle_abs=$(realpath -m -- "$oracle")
     case "$data_abs/" in
         "$out_abs"/*) die "refusing: out-bench contains DATA ($DATA)" ;;
     esac
     case "$oracle_abs/" in
-        "$out_abs"/*) die "refusing: out-bench contains the oracle ($DATA.v1out)" ;;
+        "$out_abs"/*) die "refusing: out-bench contains the oracle ($oracle)" ;;
     esac
     case "$out_abs/" in
         "$data_abs"/*) die "refusing: DATA ($DATA) contains out-bench" ;;
     esac
+}
+
+# Serialize whole bench runs: out-bench, the pinned CPUs and the comparison
+# are shared, so a second bench must wait for the first to finish.
+lock_bench() {
+    command -v flock >/dev/null 2>&1 ||
+        die "flock (util-linux) is required to serialize concurrent benches"
+    local lock=$ROOT/.bench.lock
+    : >>"$lock" || die "cannot create lock file: $lock"
+    exec 9>>"$lock" || die "cannot open lock file: $lock"
+    if ! flock -n 9; then
+        log "bench: another bench holds $lock, waiting"
+        flock 9 || die "cannot take lock $lock"
+    fi
 }
 
 oracle() {
@@ -133,6 +155,7 @@ bench() {
     resolve_cand
     require_pinned_cpus
     guard_paths
+    lock_bench
 
     log "bench: ${RUNS} run(s) of ${CAND_CMD[*]} on $DATA -> out-bench (NCPU=$VCPUS, taskset -c $CPUSET)"
     local rc=0
@@ -266,20 +289,28 @@ PY
         return 1
     fi
 
-    local oracle=$DATA.v1out cmp=0 compare_out
+    local oracle=${REF:-$DATA.v1out} cmp=0 compare_out
     if [ -L "$oracle" ]; then
         log "refusing: $oracle is a symlink"
         printf 'DIFFER\n'
         return 1
     fi
     if [ ! -e "$oracle" ]; then
-        log "oracle missing: $oracle"
-        log "run 'make oracle DATA=$DATA' first"
+        if [ -n "$REF" ]; then
+            log "REF missing: $oracle"
+        else
+            log "oracle missing: $oracle"
+            log "run 'make oracle DATA=$DATA' first"
+        fi
         printf 'DIFFER\n'
         return 1
     fi
     if ! output_complete "$oracle"; then
-        log "oracle $oracle is incomplete; remove it and rerun 'make oracle DATA=$DATA'"
+        if [ -n "$REF" ]; then
+            log "REF $oracle is incomplete candidate output"
+        else
+            log "oracle $oracle is incomplete; remove it and rerun 'make oracle DATA=$DATA'"
+        fi
         printf 'DIFFER\n'
         return 1
     fi

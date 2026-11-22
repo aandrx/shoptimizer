@@ -2,6 +2,7 @@
 dev/
 out/
 out-*/
+.bench.lock
 data
 target/
 dev-answer
