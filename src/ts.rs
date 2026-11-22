@@ -40,6 +40,117 @@ pub fn parse_ts(s: &[u8]) -> Option<i64> {
     None
 }
 
+/// Shape-first V2 entry point: F1 (`len == 20` ending in `Z`), then F2
+/// (`len == 25` with a `+`/`-` offset), then today's all-digit F3 body with a
+/// `len == 13` SWAR accelerator. Always identical to `parse_ts`, which stays the
+/// oracle and keeps its F3-first order.
+///
+/// The shape tests are disjoint from all-digit F3: a 20-byte value cannot be all
+/// digits and end in `Z`, and a 25-byte one cannot be all digits with `':'` at
+/// index 22. A 13-byte value can only be F3 (F1/F2 are 20/25 bytes).
+pub fn parse_shape(s: &[u8]) -> Option<i64> {
+    // F1: `YYYY-MM-DDTHH:MM:SSZ`.
+    if s.len() == 20 && s[19] == b'Z' {
+        return parse_civil(&s[..19]);
+    }
+    // F2: `YYYY-MM-DDTHH:MM:SS+HH:MM` / `-HH:MM`. The sign test is an explicit
+    // `||`: `b'-' | 0x10 == b'='`, so no bit trick is safe here.
+    if s.len() == 25 && (s[19] == b'+' || s[19] == b'-') && s[22] == b':' {
+        return parse_f2(s);
+    }
+    // F3: 13 ASCII digits is the generated form (~34% of rows).
+    if s.len() == 13 {
+        if let Some(value) = parse_13_digits(s) {
+            return Some(value);
+        }
+        // Not 13 ASCII digits; the oracle can only answer `None` here.
+        return parse_ts(s);
+    }
+    if !s.is_empty() && s.iter().all(u8::is_ascii_digit) {
+        return parse_digits(s);
+    }
+    None
+}
+
+/// Ingest timestamps are always F1 (`rules.md`), so V2 can skip the F2/F3 shape
+/// tests. Anything else is handed to `parse_ts`, keeping the result exact: a
+/// malformed value is `None` (and the caller reports `Parsed::Overflow`) rather
+/// than being copied through.
+pub fn parse_ingest(s: &[u8]) -> Option<i64> {
+    if s.len() == 20 && s[19] == b'Z' {
+        return parse_civil(&s[..19]);
+    }
+    parse_ts(s)
+}
+
+/// The F2 body, identical to the `parse_ts` branch. Caller checks the shape.
+fn parse_f2(s: &[u8]) -> Option<i64> {
+    let local = parse_civil(&s[..19])?;
+    let hours = parse_two_digits(&s[20..22])?;
+    let minutes = parse_two_digits(&s[23..25])?;
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+    let offset = hours as i64 * HOUR_MS + minutes as i64 * MINUTE_MS;
+    // Subtract the offset to get UTC.
+    if s[19] == b'+' {
+        local.checked_sub(offset)
+    } else {
+        local.checked_add(offset)
+    }
+}
+
+/// Value of a 13-byte ASCII-digit string, `None` if any byte is not a digit.
+/// 13 digits is always < `i64::MAX`, so no overflow check is needed.
+#[inline]
+fn parse_13_digits(s: &[u8]) -> Option<i64> {
+    let head = u64::from_le_bytes(s[0..8].try_into().ok()?);
+    // Overlapping load: bytes 5..13. Both chunks then cover all 13 bytes with
+    // loads that stay inside the already-delimited field.
+    let tail = u64::from_le_bytes(s[5..13].try_into().ok()?);
+    if !is_eight_digits(head) || !is_eight_digits(tail) {
+        return None;
+    }
+    let high = eight_digit_value(head);
+    // Bytes 8..13 of `s` are bytes 3..8 of `tail`.
+    let low = five_digit_value(tail >> 24);
+    Some((high * 100_000 + low) as i64)
+}
+
+/// True when all eight bytes packed little-endian in `v` are ASCII digits
+/// (Lemire / simdjson form, "Number Parsing at a Gigabyte per Second" §4).
+///
+/// A byte that carries out of itself is `>= 0xFA` and already fails the high
+/// nibble test, so word-wide equality cannot be reached through carry
+/// contamination; a false negative only costs a fallback.
+#[inline]
+fn is_eight_digits(v: u64) -> bool {
+    const HIGH: u64 = 0xF0F0_F0F0_F0F0_F0F0;
+    ((v & HIGH) | ((v.wrapping_add(0x0606_0606_0606_0606) & HIGH) >> 4)) == 0x3333_3333_3333_3333
+}
+
+/// Value of eight ASCII digit bytes packed little-endian in `v`.
+#[inline]
+fn eight_digit_value(v: u64) -> u64 {
+    let d = (v ^ 0x3030_3030_3030_3030) & 0x0F0F_0F0F_0F0F_0F0F;
+    four_digit_value(d) as u64 * 10_000 + four_digit_value(d >> 32) as u64
+}
+
+/// Value of five ASCII digit bytes in the low 40 bits of `v`.
+#[inline]
+fn five_digit_value(v: u64) -> u64 {
+    let d = (v ^ 0x30_3030_3030) & 0x0F_0F0F_0F0F;
+    four_digit_value(d) as u64 * 10 + ((d >> 32) & 0xF)
+}
+
+/// Value of four digit values (0..=9) in the low 32 bits of `v`.
+#[inline]
+fn four_digit_value(v: u64) -> u32 {
+    let value =
+        (v & 0xF) * 1_000 + ((v >> 8) & 0xF) * 100 + ((v >> 16) & 0xF) * 10 + ((v >> 24) & 0xF);
+    value as u32
+}
+
 /// Days since 1970-01-01 for a UTC epoch-ms instant (floor division).
 ///
 /// The result is exact for every `ms` whose UTC day is representable as `i32`:
@@ -392,6 +503,129 @@ mod tests {
         assert_eq!(day_of(max_day + 1), i32::MAX);
         assert_eq!(day_of(i64::MIN), i32::MIN);
         assert_eq!(day_of(i64::MAX), i32::MAX);
+    }
+
+    #[test]
+    fn shape_first_dispatch_matches_the_oracle_exhaustively() {
+        // Card A3: every string up to length 8 over this 10-symbol alphabet.
+        const ALPHABET: &[u8; 10] = b"019-:TZ+. ";
+
+        fn check(prefix: &mut Vec<u8>, max: usize) {
+            assert_eq!(
+                parse_shape(prefix),
+                parse_ts(prefix),
+                "dispatching {:?}",
+                String::from_utf8_lossy(prefix)
+            );
+            if prefix.len() == max {
+                return;
+            }
+            for &byte in ALPHABET {
+                prefix.push(byte);
+                check(prefix, max);
+                prefix.pop();
+            }
+        }
+
+        // One thread per first symbol keeps the ~111M inputs affordable in a
+        // debug build; a mismatch panics through `scope`.
+        std::thread::scope(|scope| {
+            for &byte in ALPHABET {
+                scope.spawn(move || check(&mut vec![byte], 8));
+            }
+        });
+    }
+
+    #[test]
+    fn shape_first_dispatch_matches_the_oracle_on_random_input() {
+        // Deterministic xorshift64: no dev-dependency needed.
+        fn next(state: &mut u64) -> u64 {
+            let mut x = *state;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *state = x;
+            x
+        }
+
+        // Plausible timestamp bytes plus every ASCII byte, so ids, quotes and
+        // control bytes are covered too.
+        const PLAUSIBLE: &[u8] = b"0123456789-:TZ+tz. \r\n,\"'eup_";
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        let mut buf = Vec::with_capacity(40);
+        for _ in 0..1_000_000 {
+            let len = (next(&mut state) % 41) as usize;
+            buf.clear();
+            for _ in 0..len {
+                let r = next(&mut state);
+                let byte = if r & 1 == 0 {
+                    (r >> 8) as u8
+                } else {
+                    PLAUSIBLE[(r >> 16) as usize % PLAUSIBLE.len()]
+                };
+                buf.push(byte);
+            }
+            assert_eq!(
+                parse_shape(&buf),
+                parse_ts(&buf),
+                "dispatching {:?}",
+                String::from_utf8_lossy(&buf)
+            );
+            assert_eq!(parse_ingest(&buf), parse_ts(&buf), "ingest {:?}", buf);
+        }
+    }
+
+    #[test]
+    fn shape_first_dispatch_matches_the_oracle_on_edge_cases() {
+        for input in [
+            &b""[..],
+            b"0",
+            b"0001791071890000",
+            b"0000000000000000000000000000001791071890000", // 31 leading zeros
+            b"9223372036854775807",
+            b"9223372036854775808", // i64::MAX + 1
+            b"9999999999999",       // 13 digits, i64::MAX
+            b"99999999999999",      // 14 digits, overflow
+            b"1791071890000",       // 13 digits
+            b"1791071890000.0",
+            b"0000000000000",
+            b"1791071890001", // 13 digits, non-zero tail
+            b"2026-10-03T23:58:10Z",
+            b"2026-10-03T19:58:10-04:00",
+            b"2026-10-03T23:58:10z",
+            b"2026-10-03t23:58:10Z",
+            b"2026-10-03 23:58:10Z",
+            b"2026-10-03T23:58:10",
+            b"2026-10-03T23:58:10+05:60",
+            b"2026-10-03T23:58:10+24:00",
+            b"2026-10-03T23:58:10+0200",
+            b"2026-10-03T23:58:10-00:00",
+            b"2026-10-03T23:58:10+00:00",
+            b"2026-10-03T23:58:10.500Z",
+            b"2026-10-03T23:58:10Z\r",
+            b"2026-10-03T23:58:10Z\n",
+            b"2026-10-03T23:58:10Z ",
+            b"1791071890000\r",
+            b"2027-02-29T00:00:00Z",
+            b"2026-10-03T24:00:00Z",
+        ] {
+            assert_eq!(
+                parse_shape(input),
+                parse_ts(input),
+                "dispatching {:?}",
+                String::from_utf8_lossy(input)
+            );
+            assert_eq!(parse_ingest(input), parse_ts(input), "ingest {:?}", input);
+        }
+        // The 13-digit accelerator reproduces the checked loop exactly.
+        assert_eq!(parse_shape(b"1791071890000"), Some(1_791_071_890_000));
+        assert_eq!(parse_shape(b"0001791071890000"), Some(1_791_071_890_000));
+        assert_eq!(parse_shape(b"9223372036854775808"), None);
+        assert_eq!(
+            parse_ingest(b"2026-10-03T23:58:10Z"),
+            Some(1_791_071_890_000)
+        );
+        assert_eq!(parse_ingest(b"2026-10-03T23:58:10z"), None);
     }
 
     const FIXTURE_MANIFEST: &str = "{\n  \"window_start\": \"2026-10-01T00:00:00Z\",\n  \"window_end\": \"2026-10-15T00:00:00Z\"\n}\n";

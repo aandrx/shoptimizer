@@ -22,7 +22,7 @@ pub fn event(line: &[u8], ctx: &Ctx) -> Parsed<EvRaw> {
         return Parsed::Overflow;
     };
     // ingest_ts is always valid F1; anything else can't be encoded exactly.
-    let Some(ingest) = ingest_raw.and_then(ts::parse_ts) else {
+    let Some(ingest) = ingest_raw.and_then(ts::parse_ingest) else {
         return Parsed::Overflow;
     };
     let Some(rel) = ingest.checked_sub(ctx.window.start) else {
@@ -48,7 +48,7 @@ pub fn event(line: &[u8], ctx: &Ctx) -> Parsed<EvRaw> {
     let Some(user) = user else {
         return Parsed::Rec(rec);
     };
-    let Some(t) = ts_raw.and_then(ts::parse_ts) else {
+    let Some(t) = ts_raw.and_then(ts::parse_shape) else {
         return Parsed::Rec(rec);
     };
     if t < ctx.window.start || t >= ctx.window.end {
@@ -107,7 +107,7 @@ pub fn click(line: &[u8], ctx: &Ctx) -> Parsed<(u128, Ck)> {
     let Some(campaign) = id::pack(campaign).and_then(|c| ctx.campaigns.get(&c).copied()) else {
         return Parsed::Skip;
     };
-    let Some(t) = ts_raw.and_then(ts::parse_ts) else {
+    let Some(t) = ts_raw.and_then(ts::parse_shape) else {
         return Parsed::Skip;
     };
     if t < ctx.click_base || t >= ctx.window.end {
@@ -255,6 +255,40 @@ mod tests {
         assert!(ck(",u1,c_1,2026-10-03T09:00:00Z").is_none());
         assert!(ck("k1,,c_1,2026-10-03T09:00:00Z").is_none());
         assert_eq!(ck("k1,u1,c_2,2026-09-24T00:00:00Z").unwrap().ts, 0);
+    }
+
+    #[test]
+    fn malformed_ingest_is_overflow_not_a_copy() {
+        let c = ctx();
+        // A bad `ingest_ts` must stay `Parsed::Overflow` (V1 fallback), never a
+        // record with a silently defaulted or truncated ingest second.
+        for ingest in [
+            "2026-10-03 10:01:00Z",     // space for T
+            "2026-10-03T10:01:00z",     // lowercase z
+            "2026-10-03T10:01:00.000Z", // fractional seconds
+            "2026-10-03T10:01:00Z\r",   // E20: \r is data
+            "2026-10-03T10:01:00",      // no zone
+            "2026-13-03T10:01:00Z",     // month 13
+            "2026-10-03T10:01:00+05:60",
+            "1791071890000.0",
+            "not-a-timestamp",
+            "",
+        ] {
+            let line = format!("e1,u1,2026-10-03T10:00:00Z,{ingest},view,p1,");
+            assert!(
+                matches!(event(line.as_bytes(), &c), Parsed::Overflow),
+                "ingest {ingest:?} must overflow"
+            );
+        }
+        // Valid F1 and exact F3 ingest values still parse as before; a whole
+        // second is required either way (`rel % 1_000 == 0`).
+        for ingest in ["2026-10-03T10:01:00Z", "1791071890000"] {
+            let line = format!("e1,u1,2026-10-03T10:00:00Z,{ingest},view,p1,");
+            assert!(
+                matches!(event(line.as_bytes(), &c), Parsed::Rec(_)),
+                "ingest {ingest:?} must parse"
+            );
+        }
     }
 
     #[test]
