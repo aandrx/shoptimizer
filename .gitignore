@@ -12,3 +12,5 @@ __pycache__/
 .venv
 .tools
 .claude/
+research_notes/
+reports/
