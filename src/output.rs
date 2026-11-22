@@ -11,9 +11,10 @@ use std::sync::Arc;
 
 use parquet::basic::Compression;
 use parquet::data_type::{ByteArray, ByteArrayType, DataType, Int32Type, Int64Type};
-use parquet::file::properties::WriterProperties;
+use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::file::writer::{SerializedColumnWriter, SerializedFileWriter};
 use parquet::schema::parser::parse_message_type;
+use parquet::schema::types::ColumnPath;
 
 const USER_DAILY_SCHEMA: &str = "
 message shoptimizer_user_daily {
@@ -82,14 +83,25 @@ fn write_optional<T: DataType>(
     col.close().map_err(parquet_err)
 }
 
+/// Low-cardinality string columns that keep dictionary encoding; every other
+/// column writes plain (S3-2).
+const DICTIONARY_COLUMNS: [&str; 3] = ["top_category", "channel", "campaign_id"];
+
 fn open_writer(dir: &Path, schema: &str, name: &str) -> io::Result<SerializedFileWriter<File>> {
     std::fs::create_dir_all(dir)?;
     let schema = Arc::new(parse_message_type(schema).map_err(parquet_err)?);
-    let props = Arc::new(
-        WriterProperties::builder()
-            .set_compression(Compression::UNCOMPRESSED)
-            .build(),
-    );
+    // S3-2: dictionary only for the low-cardinality string columns, no
+    // statistics, and no page indexes. Schema, types, nullability and DATE are
+    // untouched, so the output stays byte-for-byte valid for every reader.
+    let mut builder = WriterProperties::builder()
+        .set_compression(Compression::UNCOMPRESSED)
+        .set_dictionary_enabled(false)
+        .set_statistics_enabled(EnabledStatistics::None)
+        .set_offset_index_disabled(true);
+    for column in DICTIONARY_COLUMNS {
+        builder = builder.set_column_dictionary_enabled(ColumnPath::from(column), true);
+    }
+    let props = Arc::new(builder.build());
     let file = File::create(dir.join(name))?;
     SerializedFileWriter::new(file, schema, props).map_err(parquet_err)
 }
@@ -234,7 +246,8 @@ pub fn write_campaign_daily(dir: &Path, rows: &[CampaignDaily]) -> io::Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use parquet::basic::{ConvertedType, Type as PhysicalType};
+    use parquet::basic::{ConvertedType, Encoding, Type as PhysicalType};
+    use parquet::file::metadata::ColumnChunkMetaData;
     use parquet::file::reader::{FileReader, SerializedFileReader};
 
     fn scratch_dir(name: &str) -> std::path::PathBuf {
@@ -305,6 +318,103 @@ mod tests {
             assert_eq!(col.name(), *name);
             assert_eq!(col.physical_type(), *physical);
             assert_eq!(col.converted_type(), *converted);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn assert_no_indexes(stats_none: bool, chunk: &ColumnChunkMetaData) {
+        assert_eq!(chunk.statistics().is_none(), stats_none, "statistics");
+        assert_eq!(chunk.offset_index_offset(), None, "offset index");
+        assert_eq!(chunk.column_index_offset(), None, "column index");
+    }
+
+    fn is_dictionary_encoded(chunk: &ColumnChunkMetaData) -> bool {
+        chunk.encodings().any(|e| e == Encoding::RLE_DICTIONARY)
+    }
+
+    #[test]
+    fn written_metadata_matches_writer_settings() {
+        let dir = scratch_dir("metadata");
+        let user_dir = dir.join("user_daily");
+        let campaign_dir = dir.join("campaign_daily");
+        write_user_daily(
+            &user_dir,
+            &[UserDaily {
+                user_id: b"u1",
+                day: 20729,
+                sessions: 2,
+                events: 3,
+                revenue_cents: 500,
+                top_category: Some(b"shoes"),
+            }],
+        )
+        .unwrap();
+        write_campaign_daily(
+            &campaign_dir,
+            &[CampaignDaily {
+                campaign_id: b"c_1",
+                channel: b"paid",
+                day: 20729,
+                sessions: 1,
+                purchasing_sessions: 1,
+                revenue_cents: 500,
+                assisted_sessions: 0,
+            }],
+        )
+        .unwrap();
+
+        let user_file = File::open(user_dir.join("part-0.parquet")).unwrap();
+        let reader = SerializedFileReader::new(user_file).unwrap();
+        assert_eq!(reader.metadata().file_metadata().num_rows(), 1);
+        assert_eq!(reader.metadata().num_row_groups(), 1);
+        let chunks: Vec<_> = reader.metadata().row_group(0).columns().iter().collect();
+        let names: Vec<_> = chunks.iter().map(|c| c.column_descr().name()).collect();
+        assert_eq!(
+            names,
+            [
+                "user_id",
+                "day",
+                "sessions",
+                "events",
+                "revenue_cents",
+                "top_category"
+            ]
+        );
+        for chunk in &chunks {
+            assert_no_indexes(true, chunk);
+        }
+        assert!(!is_dictionary_encoded(chunks[0]), "user_id");
+        assert!(!is_dictionary_encoded(chunks[1]), "day");
+        assert!(!is_dictionary_encoded(chunks[2]), "sessions");
+        assert!(!is_dictionary_encoded(chunks[3]), "events");
+        assert!(!is_dictionary_encoded(chunks[4]), "revenue_cents");
+        assert!(is_dictionary_encoded(chunks[5]), "top_category");
+
+        let campaign_file = File::open(campaign_dir.join("part-0.parquet")).unwrap();
+        let reader = SerializedFileReader::new(campaign_file).unwrap();
+        assert_eq!(reader.metadata().file_metadata().num_rows(), 1);
+        let chunks: Vec<_> = reader.metadata().row_group(0).columns().iter().collect();
+        let names: Vec<_> = chunks.iter().map(|c| c.column_descr().name()).collect();
+        assert_eq!(
+            names,
+            [
+                "campaign_id",
+                "channel",
+                "day",
+                "sessions",
+                "purchasing_sessions",
+                "revenue_cents",
+                "assisted_sessions"
+            ]
+        );
+        for chunk in &chunks {
+            assert_no_indexes(true, chunk);
+        }
+        assert!(is_dictionary_encoded(chunks[0]), "campaign_id");
+        assert!(is_dictionary_encoded(chunks[1]), "channel");
+        for chunk in &chunks[2..] {
+            assert!(!is_dictionary_encoded(chunk), "{}", chunk.column_descr().name());
         }
 
         let _ = std::fs::remove_dir_all(&dir);
