@@ -547,6 +547,8 @@ A0 bench@60M + lock (first, ~45 min; both lines need it)
 
 **Benchmarks:** each line's cards may run in parallel worktrees. `make bench` holds `.bench.lock` (A0), so timed runs never overlap. Every benchmark follows the machine-state rule: THP `madvise`, swap cleared, `free -g` recorded.
 
+**Outcomes (Sat ~23:30 ET):** A0 merged to `main` (`739cea6`) with `data/p60.ref` created from `e6f1279` verified output; A1 merged to `main` (`267e0cd`, review clean); W1, W2, A3, W3 merged to `line1` (`e5a8d7c`); B1 merged to `line2` (`ce3e7da`) and B2 defaults (10, 10) adopted (`ffb7506`, winner of the 3-run confirmations: 7.516 s vs 8.053 s and 9.379 s). **A2 rejected** on its madvise A/B (see §8); the THP-`always` no-regression check was skipped (needs sudo to flip the mode) - the madvise evidence was decisive on its own. W4/B3 validation complete for both lines: G2 Docker, seeds 51-53, p60 MATCH, self-checks, sampled peak anon <= 10 GB (line1 7.40 GB, line2 6.35 GB). Dev host had swap pressure during the 60M medians (pswpin/out > 0), so treat them as +/-10%.
+
 **Deadlines (ET):**
 
 | Time | Milestone |
@@ -615,6 +617,9 @@ Space submissions out so a failure can be fixed before the next slot.
 | Sat Nov 21 | `2d9b48067e9f4909dd9f426effa71fbcfd9c20b5` | V1, single-threaded | **40.95 s** | Accepted: exact match on hidden 20M. Local native 36.2 s, so scorer ≈ 1.13× local. |
 | Sat Nov 21 | V2.0 `bf0d6d5…` (#2) | V2.0 parallel pipeline | not recorded | |
 | Sat Nov 21 ~20:00 | `e6f1279…` (HEAD at submit time; **confirm the full SHA**) | #3, Pass 1 (S3-0 to S3-7) | **2.5088 s** | Accepted. Local p20 2.27 s, so ≈ 1.1×. Leader at the time: 0.2716 s. |
+| Sat Nov 21 ~23:30 | `e5a8d7c` (branch `line1`, unpushed) | #4 candidate, Line 1 (W1 exact-key dedup + W2 flat scatter + A3 timestamps + W3 split knobs). A2 rejected | - | All gates green (G1 x3, G4, G2 Docker 0.668 s, seeds 51-53, p60 MATCH, self-checks). Local p60 median **6.616 s** (3 runs, tight), sampled peak anon 7.40 GB <= 10 GB. Not yet submitted (H7 is human). |
+| Sat Nov 21 ~23:30 | `ffb7506` (branch `line2`, unpushed) | #5 candidate, Line 2 (B1 thin-tuple dedup + B2 defaults 10/10). Excludes W1-W3 by design | - | All gates green (G1 x5 configs incl. `wide` fallback, G4, G2 Docker 0.668 s, seeds 51-53, p60 MATCH, self-checks). Local p60 median **5.866 s** (3 runs, tight), sampled peak anon 6.35 GB <= 10 GB. Not yet submitted (H8 is human). Best 60M median. |
+| Sat Nov 21 ~23:30 | `3fe9204` (branch `a2-hugealloc`, not merged) | A2 huge-page allocator - **rejected** | - | Failed acceptance under THP `madvise`: 10.801 s vs 9.506 s base median (needs >= 3% better); dedup 2.77->4.01 s with fallbacks/compaction. Registry-based ownership design is sound per review; kept for the record. |
 | | | | | |
 
 ---
