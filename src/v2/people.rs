@@ -3,10 +3,10 @@
 use hashbrown::HashMap;
 use rayon::prelude::*;
 
-use crate::csv;
 use crate::id;
 
 use super::scan;
+use super::split::split;
 
 pub struct PersonMap {
     /// Only IDs whose name differs from themselves.
@@ -36,7 +36,7 @@ pub fn build(chunks: &[&[u8]]) -> Option<PersonMap> {
         .map(|chunk| {
             let mut out = Vec::new();
             for line in scan::lines(chunk) {
-                let Some([Some(a), Some(b)]) = csv::split::<2>(line) else {
+                let Some([Some(a), Some(b)]) = split::<2>(line) else {
                     continue;
                 };
                 out.push((id::pack(a)?, id::pack(b)?));

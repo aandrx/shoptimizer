@@ -5,6 +5,7 @@ use std::fs::{self, File};
 use std::io;
 use std::path::Path;
 
+use memchr::memchr;
 use memmap2::{Advice, Mmap};
 
 /// Every non-empty `*.csv` in `dir`, mapped read-only. Zero-length files are
@@ -34,12 +35,12 @@ pub fn map_dir(dir: &Path) -> io::Result<Vec<Mmap>> {
 
 #[inline]
 fn find_newline(buf: &[u8]) -> Option<usize> {
-    buf.iter().position(|&b| b == b'\n')
+    memchr(b'\n', buf)
 }
 
 /// Chunks of about `target` bytes holding only whole data lines: the header is
 /// excluded, and each chunk ends just after a `\n` or at EOF.
-pub fn chunks<'a, T: AsRef<[u8]>>(files: &'a [T], target: usize) -> Vec<&'a [u8]> {
+pub fn chunks<T: AsRef<[u8]>>(files: &[T], target: usize) -> Vec<&[u8]> {
     let target = target.max(1);
     let mut out = Vec::new();
     for file in files {

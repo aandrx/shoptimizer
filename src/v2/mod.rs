@@ -8,6 +8,7 @@ pub mod parse;
 pub mod people;
 pub mod scan;
 pub mod sessions;
+pub mod split;
 pub mod types;
 
 use std::fs;

@@ -1,18 +1,17 @@
 //! Row parsers: one CSV line into a compact record (O1, O4, O5, O7).
 
-use crate::csv;
 use crate::id;
 use crate::ts;
 use crate::v1::{kind_of, parse_price};
 
+use super::split::split;
 use super::types::{Ck, Ctx, EvRaw, Parsed, LATE_MS, PURCHASE, VALID};
 
 /// An event copy. `Skip` = malformed line or empty `event_id`. Invalid copies
 /// are still `Rec` (without `VALID`), because dedup comes before validation.
 #[inline]
 pub fn event(line: &[u8], ctx: &Ctx) -> Parsed<EvRaw> {
-    let Some([event_id, user, ts_raw, ingest_raw, kind, product, price_raw]) =
-        csv::split::<7>(line)
+    let Some([event_id, user, ts_raw, ingest_raw, kind, product, price_raw]) = split::<7>(line)
     else {
         return Parsed::Skip;
     };
@@ -99,7 +98,7 @@ pub fn event(line: &[u8], ctx: &Ctx) -> Parsed<EvRaw> {
 /// A click and its raw user. `Skip` = malformed or invalid (no click dedup, D7).
 #[inline]
 pub fn click(line: &[u8], ctx: &Ctx) -> Parsed<(u128, Ck)> {
-    let Some([click_id, user, campaign, ts_raw]) = csv::split::<4>(line) else {
+    let Some([click_id, user, campaign, ts_raw]) = split::<4>(line) else {
         return Parsed::Skip;
     };
     let (Some(click_id), Some(user), Some(campaign)) = (click_id, user, campaign) else {
