@@ -7,11 +7,10 @@ DEV     ?= data/dev
 DATA    ?= data/dev
 SEEDS   ?= 2-30
 RUNS    ?= 3
-CPUSET  ?= 0-3,8-11
-BENCH_OUT ?= out-bench
 # The command under test; override with CAND="target/release/shoptimizer" once the Rust pipeline exists.
 CAND    ?= $(PY) reference/reference.py
-# `bench`/`oracle` need the built binary, not the reference, unless CAND is given explicitly.
+# `bench` defaults to the built binary, but honours an explicit CAND. `oracle` always uses
+# the fixed V1 binary that scripts/bench.sh hard-codes, so CAND cannot change the oracle.
 BENCH_CAND = $(if $(filter command line environment,$(origin CAND)),$(CAND),target/release/shoptimizer)
 export IMAGE CPUS MEM PLATFORM
 
@@ -51,8 +50,8 @@ run-dev: build
 
 ## Cache V1's output as the G4 oracle at $(DATA) (skips if $(DATA).v1out is complete)
 oracle:
-	PY="$(PY)" DATA="$(DATA)" CAND="$(BENCH_CAND)" scripts/bench.sh oracle
+	DATA="$(DATA)" scripts/bench.sh oracle
 
-## Bench CAND RUNS times on $(DATA), print median wall + peak RSS, then diff against the oracle
+## Bench CAND RUNS times on $(DATA) in out-bench/, print median wall + peak RSS, then diff
 bench:
-	PY="$(PY)" DATA="$(DATA)" RUNS="$(RUNS)" CAND="$(BENCH_CAND)" OUT="$(BENCH_OUT)" CPUSET="$(CPUSET)" scripts/bench.sh bench
+	PY="$(PY)" DATA="$(DATA)" RUNS="$(RUNS)" CAND="$(BENCH_CAND)" scripts/bench.sh bench
