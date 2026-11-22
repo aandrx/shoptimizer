@@ -92,7 +92,7 @@ CPUS=8 MEM=24g scripts/docker_run.sh data/p20 out-p20   # timed practice-size ru
 |---|---|---|
 | D1 | **Rust, one binary.** No DuckDB/Polars/Spark/Python at run time. | The work is CSV parsing whose dialect those readers don't follow; Python/JVM startup is timed. |
 | D2 | **V1 first:** simple, single-threaded, `&[u8]`/`Vec<u8>` IDs, correct. Submit it. **V2** adds speed behind the same tests. | Bank a correct score early (ties go to the earlier submission). V1 stays as the fallback path. |
-| D3 | Dependency allow-list: `parquet` (`default-features = false`, no arrow, uncompressed), `rayon`, `memmap2`, `mimalloc`, `hashbrown`. Nothing else without approval. | Scorer build ≤ 10 min. |
+| D3 | Dependency allow-list: `parquet` (`default-features = false`, no arrow, uncompressed), `rayon`, `memmap2`, `mimalloc`, `hashbrown`, `memchr` (added for S3-4). Nothing else without approval. | Scorer build ≤ 10 min. |
 | D4 | Docker: builder `rust:1.97-bookworm` (matches local rustc 1.97) with a dependency-cache layer; runtime `gcr.io/distroless/cc-debian12`; `ENTRYPOINT ["/shoptimizer"]`. | Small image, fast start. Distroless has no `chmod`, so `scripts/docker_run.sh` cleans up with `busybox:1.36` instead (fixed). |
 | D5 | Build flags in `.cargo/config.toml`: `target-cpu=x86-64-v3`, plus release profile `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`. `x86-64-v4` only via the T13 A/B. | AVX-512 downclocks Cascade Lake. Local Zen 4 has no penalty, so local tests flatter v4. |
 | D6 | **Packed IDs (V2):** `u128`, ID bytes big-endian from bit 127 down, zero-padded, **length in the lowest byte**. Integer `<` then equals byte-wise order. IDs > 15 bytes: the whole run falls back to the V1 path (a flag set during parse). | No shared interning table. Measured: all IDs ≤ 9 bytes in generated data, so the fallback is for safety only. |
@@ -330,23 +330,205 @@ Wave 1 tasks are pure functions with unit tests and don't depend on each other's
 
 ---
 
-### After Submission #2 (unchanged cards)
+### Submissions #3 and #4: two build passes
 
-**T13 — Profile and tune loop** · Scope: `src/**` · Depends: H5
-- Do: one idea per branch, each measured with `make bench` (T28). Candidates: SIMD/`memchr` field scanning; skip unneeded fields; radix sort on (person, ts); pre-sized per-bucket hash tables; overlap mmap faulting with parsing (`MAP_POPULATE` or a parallel pre-touch); `mimalloc`; tune `SHOPT_BUCKET_BITS` and chunk size.
-- Accept per idea: G1 + G4 + G3 (≥ 3% median win on p20, or revert).
+Source: `research/perf/SYNTHESIS.md` (ranked list), with details in `research/perf/01`–`12` and `research/perf/deep-research.md`. Base: `main` after `8cb84b0` (V2.0 code = `bf0d6d5`).
 
-**T14 — Build-flag A/B** · Scope: `.cargo/config.toml`, `Cargo.toml` · Depends: H5
-- Do: two commits, `x86-64-v3` vs `x86-64-v4`. The human submits both and keeps the faster (only trust gaps > 20%, or repeat).
-- **Low priority.** With ~20% board noise, one A/B costs two slots and will usually be inconclusive. Keep `x86-64-v3` unless spare slots remain after T13.
-- Accept: both pass G1 + G2.
+**Rules for both passes**
+- One card = one branch `s3-<n>-<slug>` / `s4-<n>-<slug>`, merged in the order given. Cards in the same wave touch different files and can run in parallel.
+- Every card that changes `src/` passes **G1 in all configs** (§7: default, `SHOPT_CHUNK_BYTES=4096`, `SHOPT_BUCKET_BITS=1 SHOPT_CHUNK_BYTES=100`, plus any new knob set to its smallest value) and **G4**. Speed cards also report `make bench DATA=data/p20` before and after (G3).
+- **V1 behaviour never changes** (D11). Shared code (`csv.rs`, `ts.rs`, `output.rs`, `v1.rs`) may only get changes that are byte-identical in output. New fast paths live under `src/v2/` with a differential test against the shared original.
+- Benchmarks run **serially**, with nothing else running, under `NCPU=8 taskset -c 0-3,8-11` (4 cores × 2 threads, like the scorer).
+- Log a row in §8 for every submission.
 
-**T15 — 60M robustness** · Scope: none unless a fix is needed · Depends: T26
-- Do: generate `data/p60` (5.5 GB). Run V2 natively and in Docker with `MEM=24g`. V1 can't serve as the 60M oracle on this laptop (~19 GB), so check G1's seed sweeps at `--events 5000000` plus the §7 self-checks on the p60 output.
-- Accept: peak RSS ≤ 8 GB; self-checks hold; median < 6 s locally.
+**Plan corrections that apply now**
+- **D3 allow-list:** add `memchr` (pure Rust, AVX2 runtime dispatch, builds in seconds) for S3-4.
+- **T14 (v3/v4 A/B): dropped.** Both research efforts say keep `x86-64-v3`.
+- **T15 gate:** measure **`RssAnon` / anonymous peak**, not RSS. RSS includes the 5.5 GB mapped input, which can't cause an OOM kill. New accept line: peak anon ≤ 10 GB at 60M.
+- **D14:** `SHOPT_BUCKET_BITS` is replaced by `SHOPT_DEDUP_BITS` and `SHOPT_PERSON_BITS` in S4-2. Raising the single knob regresses today (nb² growing `Vec`s).
+
+---
+
+### Pass 1: Submission #3 (low risk, ~8–12 h, target ≈ 1–2 s off at 60M)
+
+```
+Wave A (parallel):  S3-0 bench ─┐
+                    S3-1 cat    │
+                    S3-2 parquet├─ Wave B: S3-5 scatter+presize ── S3-6 largest-first ── Wave C: S3-4 scan ── S3-8 huge-page A/B ── S3-9 60M check ── H6 submit
+                    S3-3 exit   │
+                    S3-7 stats ─┘
+```
+
+---
+
+**S3-0 — Bench and oracle targets** (was T28) · Scope: `scripts/bench.sh` (new), `Makefile` · Depends: — · 1 h
+- `make oracle DATA=d` runs `SHOPT_ENGINE=v1 target/release/shoptimizer d d.v1out` once (skips if `d.v1out/` exists).
+- `make bench DATA=d [RUNS=3] [CAND=…]` runs the candidate `RUNS` times under `NCPU=8 taskset -c 0-3,8-11` into a fresh `out-bench/`. It prints each run's `[phase]` lines and wall time, the median wall time and peak RSS, then runs `scripts/compare.py out-bench d.v1out` and prints `MATCH`/`DIFFER`.
+- Accept: `make oracle DATA=data/p20 && make bench DATA=data/p20` prints 3 runs, a median and `MATCH`. Record the median as the **#3 baseline**.
+
+---
+
+**S3-1 — Category lookup only for purchases** · Scope: `src/v2/parse.rs` (+ its tests) · Depends: — · 1–2 h · est. 250–400 ms
+- In `parse::event` (`parse.rs:83`), do the `ctx.products` lookup only when `purchase`. Non-purchases set `cat = ctx.unknown_cat` (never read: `Ev.cat` is only used under `if ev.purchase` in `sessions.rs`).
+- **Keep every validity check unchanged:** a non-empty `product_id` is still required for all event types.
+- Accept: G1 + G4. Plus a unit test that a `view` with an unknown product is still `VALID`, and that a `purchase` gets the right category, including `unknown`.
+- Traps: E9 (unknown product wins `top_category`), E13 (empty product invalid).
+
+---
+
+**S3-2 — Parquet writer settings** · Scope: `src/output.rs` (`open_writer`, `output.rs:85-95`) · Depends: — · 1 h · est. 60–130 ms (measured locally: single-thread encode 124 → 52 ms at 2.2M rows)
+- In `WriterProperties`:
+  - dictionary **off** for every column except `top_category`, `channel` and `campaign_id`;
+  - statistics **off** (`EnabledStatistics::None`);
+  - offset/column index off, if parquet 60 exposes it.
+
+  Check the exact builder method names in the parquet 60.x docs; don't guess.
+- Metadata-only: schema, types, nullability and `DATE` are unchanged. V1 gets the same writer, and its output stays identical.
+- Accept: G1 + G4. Plus a round-trip test reading the file with `SerializedFileReader`, which confirms the schema is unchanged and that zero-row tables still carry it.
+
+---
+
+**S3-3 — Skip teardown** · Scope: `src/v2/mod.rs`, `src/main.rs` · Depends: — · 1 h · est. 50–300 ms
+- Large buffers today are freed on the critical path: `drop(ev_parts)` at `mod.rs:166`, `drop(ev_out)`/`drop(ck_parts)` at `:192-193`, and everything else when `run_v2` returns.
+- Change each mid-run `drop(x)` to `std::thread::spawn(move || drop(x))`, which frees in the background while the next phase runs.
+- At the end of a successful V2 run, after both Parquet writers have returned (files closed), flush stderr and call `std::process::exit(0)` from `main`, so `acc`, the mmaps and the maps are never dropped. V1 and the fallback path are unchanged.
+- Accept: G1 + G4. Report the wall-time delta, and peak anon memory from S3-7, since background frees may raise the peak.
+
+---
+
+**S3-7 — I/O and memory instrumentation** · Scope: `src/v2/mod.rs` (`phase()`), `src/main.rs` · Depends: — · 2 h · est. 0 ms (enables S3-8 and S3-9)
+- When `SHOPT_IO_STATS=1`, each `[phase]` line also prints:
+  - `minflt` and `majflt` deltas (from `/proc/self/stat`);
+  - `RssAnon` and `RssFile` (from `/proc/self/status`);
+  - and at the end, `VmHWM`.
+- stderr only. Off by default, with zero cost when off.
+- Accept: G1. One p20 run with stats on, pasted into the PR description.
+
+---
+
+**S3-5 — One accumulator per worker, pre-sized buffers** · Scope: `src/v2/mod.rs` (P1 folds `:76-121`, P2 output `:149`) · Depends: S3-0, S3-3 merged · 3–4 h · est. 200–400 ms
+- **P1 (events and clicks).** Replace `par_iter().fold(|| vec![Vec::new(); nb], …)`, which creates one accumulator per rayon *split*, with exactly one accumulator per worker:
+  - spawn `rayon::current_num_threads()` tasks;
+  - each task owns one `Vec<Vec<_>>` and pulls chunks from a shared `AtomicUsize` index until they run out (dynamic load balancing, one bucket set per worker).
+- **Pre-size** each worker's bucket `Vec` to `est_rows / workers / nb × 1.15`, where `est_rows = total input bytes / 70` (events) or `/ 45` (clicks). Under-estimates still grow normally; no correctness dependence.
+- **P2 output (`:149`).** Each dedup task first counts survivors per person bucket, then allocates each output `Vec` with its exact length, so nothing doubles.
+- Accept: G1 (all configs) + G4. Report `links+events`, `clicks` and `dedup` phase times and peak anon.
+- Traps: none semantic. Row order and file count are free (`rules.md` Outputs).
+
+---
+
+**S3-6 — Largest buckets first** · Scope: `src/v2/mod.rs` (P3 `:170-190`) · Depends: S3-5 · 0.5 h · est. 20–60 ms
+- In P3, iterate person buckets in descending order of total `Ev` count, so the whale bucket starts first instead of finishing last.
+- Accept: G1 + G4.
+
+---
+
+**S3-4 — Cheap scan wins** · Scope: `src/v2/scan.rs` (`find_newline`, `:36`), new `src/v2/split.rs`, `src/v2/parse.rs`, `src/v2/people.rs`, `Cargo.toml` (`memchr`) · Depends: S3-1 merged (both touch `parse.rs`) · 4–6 h · est. 400–900 ms
+- Replace `find_newline` with `memchr::memchr(b'\n', …)`.
+- Add `split::<N>` in `src/v2/split.rs`: a **single-pass** splitter with exactly the semantics of `csv::split`. Today's `csv::split` scans for commas, then `field()` rescans each field for quotes 1–2 more times. The new one walks bytes once: it finds commas (or uses `memchr` for `,`) and checks the "quote only as first and last byte" rule in the same pass. V2 (`parse.rs`, `people.rs`) calls it; V1 keeps `csv::split`.
+- Accept:
+  - A **differential test**: `v2::split::split::<N>` equals `csv::split::<N>` for every string up to length 8 over the alphabet `{',', '"', 'a', ' ', '\r'}` (N = 2, 4, 7), plus 1M random lines up to 120 bytes.
+  - G1 (all configs) + G4.
+- Traps: empty line, wrong field count, `""` → null, `"a"b`, `a"b`, `"`, CR stays data (E13, E15, E19, E20, L3).
+
+---
+
+**S3-8 — Huge pages A/B** · Scope: `Dockerfile` (`ENV` only) or `src/main.rs` (mimalloc option) · Depends: S3-5, S3-7 · 1 h · est. 0–500 ms
+- Check `/sys/kernel/mm/transparent_hugepage/enabled` locally and note it.
+- A/B `make bench` with and without `MIMALLOC_ALLOW_LARGE_OS_PAGES=1`. Confirm the variable name against libmimalloc-sys 0.1.49 (mimalloc 2.x docs).
+- Adopt the variable (as a Dockerfile `ENV`) only if the p20 median improves ≥ 3% across 2 × 3 runs. Otherwise record the result and drop it.
+- Accept: G4 under the adopted setting.
+
+---
+
+**S3-9 — 60M check (revised T15)** · Scope: none unless a fix is needed · Depends: all S3 cards · 1 h
+- Generate `data/p60`:
+
+  ```
+  .tools/generate --seed 9 --events 60000000 --clicks 15000000 --output data/p60
+  ```
+
+- Run V2 once natively with `SHOPT_IO_STATS=1` under `NCPU=8 taskset -c 0-3,8-11`.
+- Check the §7 self-checks on the output:
+  - summed `sessions` and `revenue_cents` are equal across the two tables;
+  - summed `assisted_sessions` ≥ credited non-organic sessions.
+- Run G1's 2M sweep at `--events 5000000 --clicks 1250000` on seeds 51–53.
+- Accept: peak anon ≤ 10 GB; self-checks hold; 5M seeds match; record the 60M wall time.
+
+---
+
+**H6 — Submit #3** · Human · §8 protocol (G2 in Docker first). Record the practice time.
+
+---
+
+### Pass 2: Submission #4 (structural, ~10–15 h, target ≈ another 1–1.8 s at 60M)
+
+Start only after #3 is merged and scored. Re-profile first (S4-0). If the profile has shifted, re-rank before building.
+
+```
+S4-0 profile ── S4-1 counted scatter ── S4-2 split bits ──┬── S4-3 compact dedup ──┐
+                                                          └── S4-4 sub-partition ──┴── S4-5 60M check ── H7 submit
+```
+
+---
+
+**S4-0 — Re-profile** · Scope: `research/perf/00-profile-s3.md` (new) · Depends: H6 · 1 h
+- Same method as `research/perf/00-profile.md` (gperftools if `perf` is unavailable), on the #3 code at p20.
+- Output: the top 25 symbols and phase table. If dedup + sessions are no longer ≥ 30% of CPU, stop and re-rank with the synthesis.
+
+---
+
+**S4-1 — Counted person scatter** · Scope: `src/v2/mod.rs` (P2 → P3 handoff), `src/v2/sessions.rs` (`run_bucket` input) · Depends: S4-0 · 3–4 h · est. 100–300 ms
+- Each dedup task writes its survivors into **one** `Vec<Ev>` grouped by person bucket, with an `offsets: Vec<u32>` of length `nb_person + 1`. Count first, prefix-sum, then fill, replacing `Vec<Vec<Ev>>` (`mod.rs:149`).
+- P3 reads bucket `p` as the slices `task.evs[offsets[p]..offsets[p+1]]` across tasks. Concatenate as today, or sort the slices in place if `run_bucket` is changed to take a gathered buffer.
+- Clicks keep their S3-5 per-worker pre-sized buckets.
+- Accept: G1 (all configs) + G4. Report the `dedup` and `sessions` phase times.
+
+---
+
+**S4-2 — Separate dedup and person bucket counts** · Scope: `src/v2/mod.rs`, `PLAN.md` D14 · Depends: S4-1 · 1–2 h
+- Replace `SHOPT_BUCKET_BITS` with `SHOPT_DEDUP_BITS` (P1 event scatter and P2 tasks) and `SHOPT_PERSON_BITS` (P2 output, click scatter and P3). The two now vary independently. Keep `SHOPT_BUCKET_BITS` working as a shorthand that sets both.
+- A/B on p20: `SHOPT_DEDUP_BITS` ∈ {8, 10, 11, 12} × `SHOPT_PERSON_BITS` ∈ {8, 10}. Set the defaults to the best median, and expect ≥ 10 dedup bits (L2-sized buckets).
+- Accept: G1 with both knobs at 1, and at the chosen defaults; G4.
+
+---
+
+**S4-3 — Compact dedup table** · Scope: `src/v2/dedup.rs` (new), `src/v2/mod.rs` (P2) · Depends: S4-2 · 6–8 h · est. 500–1,000 ms (with S4-2)
+- Replace `HashMap<u128, EvRaw>` (`mod.rs:133`) with an open-addressing table. Slots hold `(fingerprint: u32 or u64, idx: u32)`; size is a power of two ≥ 2 × bucket length; linear probing.
+- `idx` encodes `(worker << 27) | offset` into the per-worker `EvRaw` slices (S3-5 guarantees ≤ 16 workers; assert `offset < 2^27`).
+- Hash: reuse `id::mix(id)`. Bucket selection already uses its top bits, so the table uses the low bits.
+- On a fingerprint match, **compare the full `u128` id**: never trust the hash alone.
+- Keep the min `ingest_s` copy; on equal `ingest_s`, either copy is fine (identical).
+- Accept:
+  - A unit test with a forced-collision hash (test-only hook that maps every id to the same fingerprint) giving the same result as `HashMap`.
+  - A randomized test against the current `HashMap` dedup.
+  - G1 (all configs, with `SHOPT_DEDUP_BITS=1`) + G4.
+- Traps: E4 (kept copy's user), E5 (invalid kept copy drops the event).
+
+---
+
+**S4-4 — Sub-partition person buckets before sorting** · Scope: `src/v2/sessions.rs` (`run_bucket`, `:186`) · Depends: S4-2 · 4–6 h · est. 150–400 ms
+- Inside `run_bucket`, hash-partition `evs` and `cks` by a **second** hash of `person` (bits of `id::mix(person)` disjoint from the bucket bits) into `k` sub-runs. Choose `k` so each sub-run is ≤ ~16k `Ev` (≈ 0.5 MB); `k` = 1 for small buckets.
+- Events and clicks use the same function, so a person's events and clicks always land in the same sub-run. Then sort and walk each sub-run exactly as today.
+- No dense person index, so `u128` person order is kept and the merge-join by `person` still works (`sessions.rs` run_bucket).
+- Accept: G1 (all configs) + G4. Plus a unit test where one person has events in a bucket and clicks only in the same sub-run.
+- Traps: E16 (equal ts), A5 (credit tie), whale person (one sub-run may be large; that's fine).
+
+---
+
+**S4-5 — 60M check** · Same as S3-9 on the #4 code. Accept: peak anon ≤ 10 GB, self-checks, 5M seeds match, 60M time recorded.
+
+---
+
+**H7 — Submit #4** · Human · §8 protocol.
+
+---
+
+### Not in these passes (decided)
+Full AVX2 structural scanner (pi 01 #1; a candidate for a Submission #5 if time remains after #4), timestamp SWAR fast path (pi 02), packed-`u64` radix sort, parse clicks during dedup, person-map prefetch, hand-written Parquet, PGO, AVX-512, fused streaming P1→P2, parallel union-find.
 
 **H4 — Final pick and freeze** · Human · Sun 09:00 AM ET
-- Pick the fastest commit that passed G1 + G2 + G4 and an accepted practice run. Make sure it's pushed and the repo is public. No new submissions after freeze unless the current best is broken.
+- Pick the fastest commit that passed G1 + G2 + G4, the latest 60M check, and an accepted practice run. Make sure it's pushed and the repo is public. No new submissions after freeze unless the current best is broken.
 
 ---
 
@@ -359,7 +541,7 @@ Wave 1 tasks are pure functions with unit tests and don't depend on each other's
 | **G3 performance** | `make bench DATA=data/p20` vs the best recorded in §8 | median no worse than +5% (unless the change is a correctness fix) |
 | **G4 big-data oracle** | `make oracle DATA=data/p20` (once) · `make bench DATA=data/p20` | `MATCH` against V1's cached output. V1 matched the hidden 20M set exactly, so it's the trusted oracle at sizes the Python reference can't handle. |
 
-V2 tasks run G1 twice: default chunk size and `SHOPT_CHUNK_BYTES=4096`.
+V2 tasks run G1 in every config: default, `SHOPT_CHUNK_BYTES=4096`, and `SHOPT_BUCKET_BITS=1 SHOPT_CHUNK_BYTES=100` (after S4-2: `SHOPT_DEDUP_BITS=1 SHOPT_PERSON_BITS=1 SHOPT_CHUNK_BYTES=100`).
 
 ---
 
