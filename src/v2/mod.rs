@@ -13,7 +13,8 @@ pub mod types;
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use hashbrown::hash_map::Entry;
@@ -38,6 +39,59 @@ fn env_usize(name: &str, default: usize) -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+/// Initial capacity for one worker's bucket `Vec` (S3-5):
+/// `total_bytes / bytes_per_row / workers / nb * 1.15`.
+///
+/// Only a hint: under-estimates grow normally, so correctness never depends on
+/// it. `bytes_per_row` is the observed average row size (events 70, clicks 45).
+fn prealloc_cap(total_bytes: usize, bytes_per_row: usize, workers: usize, nb: usize) -> usize {
+    let rows = total_bytes / bytes_per_row.max(1);
+    (rows as u64 * 115 / (100 * workers.max(1) as u64 * nb.max(1) as u64)) as usize
+}
+
+/// P1 scatter: exactly one bucket set per worker, chunks pulled from a shared
+/// index (D14, D9).
+///
+/// Spawns `rayon::current_num_threads()` tasks into the current pool; no nested
+/// pool, so a fixed pool size is never oversubscribed. Each task owns its own
+/// `Vec<Vec<T>>` and takes the next unclaimed chunk until none are left, which
+/// keeps large chunks from stranding a worker.
+fn scatter<T, F>(
+    chunks: &[&[u8]],
+    nb: usize,
+    cap: usize,
+    overflow: &AtomicBool,
+    parse: F,
+) -> Vec<Vec<Vec<T>>>
+where
+    T: Send,
+    F: Fn(&[u8]) -> Parsed<(usize, T)> + Sync,
+{
+    let workers = rayon::current_num_threads().max(1);
+    let next = AtomicUsize::new(0);
+    let parts: Mutex<Vec<Vec<Vec<T>>>> = Mutex::new(Vec::with_capacity(workers));
+    rayon::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|_| {
+                let mut buckets: Vec<Vec<T>> = (0..nb).map(|_| Vec::with_capacity(cap)).collect();
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(chunk) = chunks.get(i) else { break };
+                    for line in scan::lines(chunk) {
+                        match parse(line) {
+                            Parsed::Rec((b, r)) => buckets[b].push(r),
+                            Parsed::Skip => {}
+                            Parsed::Overflow => overflow.store(true, Ordering::Relaxed),
+                        }
+                    }
+                }
+                parts.lock().unwrap().push(buckets);
+            });
+        }
+    });
+    parts.into_inner().unwrap()
 }
 
 /// Runs V2 and drops everything normally when it returns.
@@ -92,23 +146,17 @@ fn run_v2(data: &Path, out: &Path, on_success: impl FnOnce()) -> io::Result<bool
     let ev_chunks = scan::chunks(&event_maps, chunk);
     let (people, ev_parts) = rayon::join(
         || people::build(&link_chunks),
-        || -> Vec<Vec<Vec<EvRaw>>> {
-            ev_chunks
-                .par_iter()
-                .fold(
-                    || vec![Vec::new(); nb],
-                    |mut acc: Vec<Vec<EvRaw>>, c| {
-                        for line in scan::lines(c) {
-                            match parse::event(line, &ctx) {
-                                Parsed::Rec(r) => acc[id::bucket(r.id, bits)].push(r),
-                                Parsed::Skip => {}
-                                Parsed::Overflow => overflow.store(true, Ordering::Relaxed),
-                            }
-                        }
-                        acc
-                    },
-                )
-                .collect()
+        || {
+            let workers = rayon::current_num_threads().max(1);
+            let bytes: usize = ev_chunks.iter().map(|c| c.len()).sum();
+            let cap = prealloc_cap(bytes, 70, workers, nb);
+            scatter(&ev_chunks, nb, cap, &overflow, |line| {
+                match parse::event(line, &ctx) {
+                    Parsed::Rec(r) => Parsed::Rec((id::bucket(r.id, bits), r)),
+                    Parsed::Skip => Parsed::Skip,
+                    Parsed::Overflow => Parsed::Overflow,
+                }
+            })
         },
     );
     let Some(people) = people else {
@@ -117,25 +165,21 @@ fn run_v2(data: &Path, out: &Path, on_success: impl FnOnce()) -> io::Result<bool
     phase("links+events", started);
     let started = Instant::now();
     let ck_chunks = scan::chunks(&click_maps, chunk);
-    let ck_parts: Vec<Vec<Vec<Ck>>> = ck_chunks
-        .par_iter()
-        .fold(
-            || vec![Vec::new(); nb],
-            |mut acc: Vec<Vec<Ck>>, c| {
-                for line in scan::lines(c) {
-                    match parse::click(line, &ctx) {
-                        Parsed::Rec((user, mut ck)) => {
-                            ck.person = people.person(user);
-                            acc[id::bucket(ck.person, bits)].push(ck);
-                        }
-                        Parsed::Skip => {}
-                        Parsed::Overflow => overflow.store(true, Ordering::Relaxed),
-                    }
+    let ck_parts: Vec<Vec<Vec<Ck>>> = {
+        let workers = rayon::current_num_threads().max(1);
+        let bytes: usize = ck_chunks.iter().map(|c| c.len()).sum();
+        let cap = prealloc_cap(bytes, 45, workers, nb);
+        scatter(&ck_chunks, nb, cap, &overflow, |line| {
+            match parse::click(line, &ctx) {
+                Parsed::Rec((user, mut ck)) => {
+                    ck.person = people.person(user);
+                    Parsed::Rec((id::bucket(ck.person, bits), ck))
                 }
-                acc
-            },
-        )
-        .collect();
+                Parsed::Skip => Parsed::Skip,
+                Parsed::Overflow => Parsed::Overflow,
+            }
+        })
+    };
     if overflow.load(Ordering::Relaxed) {
         return Ok(false);
     }
@@ -163,14 +207,27 @@ fn run_v2(data: &Path, out: &Path, on_success: impl FnOnce()) -> io::Result<bool
                     }
                 }
             }
-            let mut out: Vec<Vec<Ev>> = vec![Vec::new(); nb];
+            // Count VALID survivors per destination person bucket, so each output
+            // Vec gets its exact capacity and never doubles (S3-5).
+            //
+            // The dedup map's `user` field is dead after this point, so each
+            // survivor's person is written back into it; the fill pass then needs
+            // no second `people.person` lookup.
+            let mut counts = vec![0usize; nb];
+            for r in kept.values_mut() {
+                if r.flags & VALID == 0 {
+                    continue;
+                }
+                r.user = people.person(r.user);
+                counts[id::bucket(r.user, bits)] += 1;
+            }
+            let mut out: Vec<Vec<Ev>> = counts.into_iter().map(Vec::with_capacity).collect();
             for r in kept.values() {
                 if r.flags & VALID == 0 {
                     continue;
                 }
-                let person = people.person(r.user);
-                out[id::bucket(person, bits)].push(Ev {
-                    person,
+                out[id::bucket(r.user, bits)].push(Ev {
+                    person: r.user,
                     ts: r.ts,
                     price: r.price,
                     cat: r.cat,
@@ -278,4 +335,51 @@ fn write_campaigns(dir: &Path, camp: &[[i64; 4]], ctx: &Ctx) -> io::Result<()> {
         }
     }
     output::write_campaign_daily(dir, &rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prealloc_cap_matches_formula() {
+        // 70 MB of events, 16 workers, 256 buckets: 256 rows/worker/bucket, +15%.
+        assert_eq!(prealloc_cap(70 << 20, 70, 16, 256), 294);
+        assert_eq!(prealloc_cap(0, 70, 16, 256), 0);
+        // Degenerate divisors never panic or divide by zero.
+        assert_eq!(prealloc_cap(700, 0, 0, 0), 700 * 115 / 100);
+    }
+
+    #[test]
+    fn scatter_visits_every_chunk_once() {
+        // Four chunks of uneven size, more workers than chunks: every line must
+        // land in exactly one bucket, and every worker owns a full bucket set.
+        let chunks: Vec<&[u8]> = vec![b"a\nb\n", b"", b"c\n", b"d\ne\nf\n"];
+        let nb = 4;
+        let overflow = AtomicBool::new(false);
+        let parts = scatter(&chunks, nb, 1, &overflow, |line| {
+            Parsed::Rec(((line[0] as usize - 'a' as usize) % nb, line[0]))
+        });
+        assert!(!overflow.load(Ordering::Relaxed));
+        assert_eq!(parts.len(), rayon::current_num_threads().max(1));
+        assert!(parts.iter().all(|p| p.len() == nb));
+        let mut got: Vec<u8> = parts.iter().flatten().flatten().copied().collect();
+        got.sort_unstable();
+        assert_eq!(got, b"abcdef");
+    }
+
+    #[test]
+    fn scatter_reports_overflow() {
+        let chunks: Vec<&[u8]> = vec![b"a\n", b"b\n"];
+        let overflow = AtomicBool::new(false);
+        let parts = scatter::<u8, _>(&chunks, 2, 0, &overflow, |line| {
+            if line[0] == b'a' {
+                Parsed::Overflow
+            } else {
+                Parsed::Rec((1, b'b'))
+            }
+        });
+        assert!(overflow.load(Ordering::Relaxed));
+        assert_eq!(parts.iter().flatten().flatten().count(), 1);
+    }
 }
