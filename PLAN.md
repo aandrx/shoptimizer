@@ -618,9 +618,9 @@ Space submissions out so a failure can be fixed before the next slot.
 | Sat Nov 21 | V2.0 `bf0d6d5…` (#2) | V2.0 parallel pipeline | not recorded | |
 | Sat Nov 21 ~20:00 | `e6f1279…` (HEAD at submit time; **confirm the full SHA**) | #3, Pass 1 (S3-0 to S3-7) | **2.5088 s** | Accepted. Local p20 2.27 s, so ≈ 1.1×. Leader at the time: 0.2716 s. |
 | Sat Nov 21 ~23:30 | `e5a8d7c` (branch `line1`, unpushed) | #4 candidate, Line 1 (W1 exact-key dedup + W2 flat scatter + A3 timestamps + W3 split knobs). A2 rejected | - | All gates green (G1 x3, G4, G2 Docker 0.668 s, seeds 51-53, p60 MATCH, self-checks). Local p60 median **6.616 s** (3 runs, tight), sampled peak anon 7.40 GB <= 10 GB. Not yet submitted (H7 is human). |
-| Sat Nov 21 ~23:30 | `ffb7506` (branch `line2`, unpushed) | #5 candidate, Line 2 (B1 thin-tuple dedup + B2 defaults 10/10). Excludes W1-W3 by design | - | All gates green (G1 x5 configs incl. `wide` fallback, G4, G2 Docker 0.668 s, seeds 51-53, p60 MATCH, self-checks). Local p60 median **5.866 s** (3 runs, tight), sampled peak anon 6.35 GB <= 10 GB. Not yet submitted (H8 is human). Best 60M median. |
+| Sat Nov 21 ~23:30 | `ffb7506` (branch `line2`, pushed as `submission/v5`) | #5 candidate, Line 2 (B1 thin-tuple dedup + B2 defaults 10/10). Excludes W1-W3 by design | - | All gates green (G1 x5 configs incl. `wide` fallback, G4, G2 Docker 0.668 s, seeds 51-53, p60 MATCH, self-checks). Local p60 median **5.866 s** (3 runs, tight), sampled peak anon 6.35 GB <= 10 GB. Not yet submitted (H8 is human). Best 60M median. |
 | Sat Nov 21 ~23:30 | `3fe9204` (branch `a2-hugealloc`, not merged) | A2 huge-page allocator - **rejected** | - | Failed acceptance under THP `madvise`: 10.801 s vs 9.506 s base median (needs >= 3% better); dedup 2.77->4.01 s with fallbacks/compaction. Registry-based ownership design is sound per review; kept for the record. |
-| | | | | |
+| Sat Nov 21 21:45 | `ffb750632b853f3528f5835f5ebb20411436f332` | #5 push (Line 2: B1 + B2, `submission/v5`) | - | Form values handed to the human; the form entry is the human step. Gates: G1 x5 configs, G4, G2 Docker 0.668 s, seeds 51-53, p60 MATCH vs `data/p60.ref`, 60M median 5.866 s, sampled peak anon 6.35 GB. |
 
 ---
 
