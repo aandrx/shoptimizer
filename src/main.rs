@@ -24,11 +24,13 @@ use std::time::Instant;
 /// `SHOPT_IO_STATS=1` phase instrumentation (PLAN.md §6 S3-7). Off by default:
 /// the disabled path does no `/proc` I/O and reads the env var only once.
 ///
-/// `RssAnon`/`RssFile` are point samples taken at each phase boundary, so they
-/// miss transient peaks inside a phase. `VmHWM` is the kernel-tracked peak of
-/// the whole resident set (anon plus file-backed pages), printed once at the
-/// end; it is the number to quote for peak memory, and it can exceed every
-/// sampled `RssAnon`.
+/// `RssAnon`/`RssFile` are point samples taken at each phase boundary, from one
+/// read of `/proc/self/status`, so they are coherent with each other but miss
+/// transient peaks inside a phase. `VmHWM` is the kernel-tracked peak of the
+/// whole resident set (anon plus file-backed pages), printed once at the end.
+/// It is *not* the anon cap metric: a sampled `RssAnon` is only a lower bound on
+/// the anon peak, and `VmHWM` can be larger than peak anon because it also
+/// counts mapped file pages. Quote `VmHWM` for total peak memory, not for anon.
 pub(crate) mod iostats {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::OnceLock;
@@ -47,10 +49,10 @@ pub(crate) mod iostats {
         let close = stat.iter().rposition(|&b| b == b')')?;
         let mut minflt = None;
         let mut majflt = None;
-        let mut index = 0usize;
-        for field in stat[close + 1..]
+        for (index, field) in stat[close + 1..]
             .split(|b| b.is_ascii_whitespace())
             .filter(|f| !f.is_empty())
+            .enumerate()
         {
             match index {
                 7 => minflt = parse_u64(field),
@@ -60,7 +62,6 @@ pub(crate) mod iostats {
                 }
                 _ => {}
             }
-            index += 1;
         }
         Some((minflt?, majflt?))
     }
@@ -89,8 +90,19 @@ pub(crate) mod iostats {
         parse_faults(&std::fs::read("/proc/self/stat").ok()?)
     }
 
-    fn status_kb(key: &[u8]) -> Option<u64> {
-        parse_status_kb(&std::fs::read("/proc/self/status").ok()?, key)
+    fn status() -> Option<Vec<u8>> {
+        std::fs::read("/proc/self/status").ok()
+    }
+
+    /// One read of `/proc/self/status`, so the two samples describe one moment.
+    fn rss() -> (Option<u64>, Option<u64>) {
+        match status() {
+            Some(status) => (
+                parse_status_kb(&status, b"RssAnon:"),
+                parse_status_kb(&status, b"RssFile:"),
+            ),
+            None => (None, None),
+        }
     }
 
     // minflt, majflt of the previous phase line, for per-phase deltas.
@@ -113,8 +125,7 @@ pub(crate) mod iostats {
         } else {
             (minflt, majflt)
         };
-        let anon = status_kb(b"RssAnon:");
-        let file = status_kb(b"RssFile:");
+        let (anon, file) = rss();
         eprintln!(
             "[phase] {name} {ms}ms minflt=+{d_min} majflt=+{d_maj} \
              RssAnon={}kB RssFile={}kB",
@@ -123,12 +134,13 @@ pub(crate) mod iostats {
         );
     }
 
-    /// Kernel-tracked peak resident set for the whole run.
+    /// Kernel-tracked peak resident set (whole RSS, not the anon cap) at exit.
     pub fn log_peak() {
         if !enabled() {
             return;
         }
-        match status_kb(b"VmHWM:") {
+        let hwm = status().and_then(|status| parse_status_kb(&status, b"VmHWM:"));
+        match hwm {
             Some(kb) => eprintln!("[stats] VmHWM={kb}kB"),
             None => eprintln!("[stats] VmHWM=?"),
         }
