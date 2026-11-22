@@ -63,6 +63,14 @@ fn bucket_lens<T: Sync>(parts: &[Vec<Vec<T>>], nb: usize) -> Vec<usize> {
         .collect()
 }
 
+/// Total `Ev` count per person bucket across the flat P2 outputs (S4-1).
+fn flat_lens(parts: &[dedup::Flat], nb: usize) -> Vec<usize> {
+    (0..nb)
+        .into_par_iter()
+        .map(|b| parts.iter().map(|p| p.bucket(b).len()).sum())
+        .collect()
+}
+
 /// P3 schedule (S3-6): buckets in descending order of their total `Ev` count so
 /// the whale bucket starts first instead of finishing last. Ties keep bucket
 /// index order, making the schedule deterministic.
@@ -206,19 +214,26 @@ fn run_v2(data: &Path, out: &Path, on_success: impl FnOnce()) -> io::Result<bool
     }
     phase("clicks", started);
 
-    // ---- P2: dedup per event bucket, then re-partition by person
+    // ---- P2: dedup per event bucket, then re-partition by person. Each dedup
+    // task returns one flat `Vec<Ev>` with disjoint per-person-bucket ranges
+    // (S4-1), so P3 only has to concatenate slices.
     let started = Instant::now();
-    let ev_out: Vec<Vec<Vec<Ev>>> = (0..nb)
+    let ev_out: Vec<dedup::Flat> = match (0..nb)
         .into_par_iter()
         .map(|b| dedup::partition_bucket(b, &ev_parts, &people, bits, nb))
-        .collect();
+        .collect::<Option<Vec<_>>>()
+    {
+        Some(out) => out,
+        // Checked offsets overflow `usize`: not representable here, use V1.
+        None => return Ok(false),
+    };
     // S3-3: free the parse buffers in the background instead of on the critical path.
     std::thread::spawn(move || drop(ev_parts));
     phase("dedup", started);
 
     // ---- P3: sessions per person bucket
     let started = Instant::now();
-    let ev_lens = bucket_lens(&ev_out, nb);
+    let ev_lens = flat_lens(&ev_out, nb);
     let ck_lens = bucket_lens(&ck_parts, nb);
     let acc = bucket_order(&ev_lens)
         .into_par_iter()
@@ -226,8 +241,8 @@ fn run_v2(data: &Path, out: &Path, on_success: impl FnOnce()) -> io::Result<bool
             || Acc::new(&ctx),
             |mut acc, b| {
                 let mut evs: Vec<Ev> = Vec::with_capacity(ev_lens[b]);
-                for o in &ev_out {
-                    evs.extend_from_slice(&o[b]);
+                for f in &ev_out {
+                    evs.extend_from_slice(f.bucket(b));
                 }
                 let mut cks: Vec<Ck> = Vec::with_capacity(ck_lens[b]);
                 for p in &ck_parts {
