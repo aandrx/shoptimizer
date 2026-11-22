@@ -235,17 +235,19 @@ fn run_v2(data: &Path, out: &Path, on_success: impl FnOnce()) -> io::Result<bool
     let shorthand = std::env::var("SHOPT_BUCKET_BITS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok());
+    // B2: (10, 10) won the pinned 60M A/B (7.52 s vs 10.23 s at (11,8),
+    // 8.05 s at (10,8), 9.38 s at (12,10)); see PLAN.md §8.
     let dedup_bits = std::env::var("SHOPT_DEDUP_BITS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .or(shorthand)
-        .unwrap_or(11)
+        .unwrap_or(10)
         .min(16) as u32;
     let person_bits = std::env::var("SHOPT_PERSON_BITS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .or(shorthand)
-        .unwrap_or(8)
+        .unwrap_or(10)
         .min(16) as u32;
     let thin = std::env::var("SHOPT_DEDUP").as_deref() != Ok("wide");
     let nd = 1usize << dedup_bits;
