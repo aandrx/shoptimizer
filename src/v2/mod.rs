@@ -11,6 +11,8 @@ pub mod sessions;
 pub mod split;
 pub mod types;
 
+mod dedup;
+
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -18,8 +20,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use hashbrown::hash_map::Entry;
-use hashbrown::HashMap;
 use rayon::prelude::*;
 
 use crate::agg::ORGANIC;
@@ -28,7 +28,7 @@ use crate::output::{self, CampaignDaily, UserDaily};
 use crate::ts::Window;
 
 use sessions::{Acc, ASSISTED, PURCHASING, REVENUE, SESSIONS};
-use types::{Ck, Ctx, Ev, EvRaw, Parsed, PURCHASE, VALID};
+use types::{Ck, Ctx, Ev, Parsed};
 
 /// Phase log line; `SHOPT_IO_STATS=1` adds fault and RSS fields (S3-7).
 fn phase(name: &str, started: Instant) {
@@ -210,53 +210,7 @@ fn run_v2(data: &Path, out: &Path, on_success: impl FnOnce()) -> io::Result<bool
     let started = Instant::now();
     let ev_out: Vec<Vec<Vec<Ev>>> = (0..nb)
         .into_par_iter()
-        .map(|b| {
-            let total: usize = ev_parts.iter().map(|p| p[b].len()).sum();
-            let mut kept: HashMap<u128, EvRaw> = HashMap::with_capacity(total);
-            for part in &ev_parts {
-                for r in &part[b] {
-                    match kept.entry(r.id) {
-                        Entry::Occupied(mut o) => {
-                            // Equal ingest_ts copies are identical: either is fine.
-                            if r.ingest_s < o.get().ingest_s {
-                                o.insert(*r);
-                            }
-                        }
-                        Entry::Vacant(v) => {
-                            v.insert(*r);
-                        }
-                    }
-                }
-            }
-            // Count VALID survivors per destination person bucket, so each output
-            // Vec gets its exact capacity and never doubles (S3-5).
-            //
-            // The dedup map's `user` field is dead after this point, so each
-            // survivor's person is written back into it; the fill pass then needs
-            // no second `people.person` lookup.
-            let mut counts = vec![0usize; nb];
-            for r in kept.values_mut() {
-                if r.flags & VALID == 0 {
-                    continue;
-                }
-                r.user = people.person(r.user);
-                counts[id::bucket(r.user, bits)] += 1;
-            }
-            let mut out: Vec<Vec<Ev>> = counts.into_iter().map(Vec::with_capacity).collect();
-            for r in kept.values() {
-                if r.flags & VALID == 0 {
-                    continue;
-                }
-                out[id::bucket(r.user, bits)].push(Ev {
-                    person: r.user,
-                    ts: r.ts,
-                    price: r.price,
-                    cat: r.cat,
-                    purchase: r.flags & PURCHASE != 0,
-                });
-            }
-            out
-        })
+        .map(|b| dedup::partition_bucket(b, &ev_parts, &people, bits, nb))
         .collect();
     // S3-3: free the parse buffers in the background instead of on the critical path.
     std::thread::spawn(move || drop(ev_parts));
