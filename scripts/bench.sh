@@ -164,18 +164,18 @@ def layout_problem(path):
         try:
             if entry.is_symlink():
                 return f"{entry.name!r} is a symlink"
-            if entry.name in TABLES:
-                if not entry.is_dir(follow_symlinks=False):
-                    return f"{entry.name!r} is not a directory"
-                for child in os.scandir(entry.path):
-                    if child.is_symlink():
-                        return f"{entry.name}/{child.name!r} is a symlink"
-                    if not child.is_file(follow_symlinks=False):
-                        return f"{entry.name}/{child.name!r} is not a regular file"
-            elif entry.name.startswith((".", "_")) and entry.is_file(follow_symlinks=False):
-                continue
-            else:
+            if entry.name not in TABLES:
                 return f"unexpected entry {entry.name!r}"
+            if not entry.is_dir(follow_symlinks=False):
+                return f"{entry.name!r} is not a directory"
+            for child in os.scandir(entry.path):
+                if child.is_symlink():
+                    return f"{entry.name}/{child.name!r} is a symlink"
+                if not child.is_file(follow_symlinks=False):
+                    return f"{entry.name}/{child.name!r} is not a regular file"
+                name = child.name
+                if name.startswith((".", "_")) or not name.endswith(".parquet"):
+                    return f"{entry.name}/{name!r} is not a Parquet output file"
         except OSError as exc:
             return f"cannot inspect {entry.name!r}: {exc}"
     return None
