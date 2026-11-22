@@ -480,7 +480,7 @@ Wave A (parallel):  S3-0 bench ─┐
 | Sun 08:30 | Fix-only buffer. Optionally one small extra card if #4 is clean. | | |
 | Sun 09:00 | **H4** freeze | human | |
 
-**Allowed while research runs:** implement S4-1 and S4-2 (no benchmarks; G1 only), because every round-1 source endorses them. If the synthesis replaces dedup with a global winner table, S4-1's dedup side may be dropped, but its person-side counted scatter still applies. Don't start S4-3 or S4-4 before the synthesis.
+**Research closed:** R2-2 has landed; the research-only restrictions applied to the fan-out, and implementation order is now set by Pass 2′ below. Nothing from Pass 2 (old) may start except through its renumbered card.
 
 **Decision rules for the synthesis:**
 - Rank by ms saved **at 60M** per hour, not at 20M.
@@ -488,71 +488,83 @@ Wave A (parallel):  S3-0 bench ─┐
 - Nothing ships that lacks an exact fallback for rows the fast path rejects (D11, rule 3 of the brief).
 - Keep total Pass 2′ effort ≤ 9 h of implementer time. Anything bigger is split, and only its first half is built.
 
-### Pass 2: Submission #4 (structural, ~10–15 h, target ≈ another 1–1.8 s at 60M)
+### Pass 2′: Submission #4 (renumbered by the round-2 synthesis R2-2)
 
-**Superseded by Pass 2′ once R2-2 lands.** Until then these cards stand, but only S4-1 and S4-2 may start (see Round 2). S4-0's profile is now R2-0 (at 60M, in `research/perf2/00-profile.md`).
+**Source:** `research/perf2/SYNTHESIS.md` (ranked decisions and rejections), per-track detail in `research/perf2/01`–`08`, external evidence in `research/perf2/deep-research.md`. Base: `main` at `e6f1279` (#3). Hard cap: **9 implementer-hours including gates**. Build in wave order; one branch per card.
 
 ```
-S4-0 profile ── S4-1 counted scatter ── S4-2 split bits ──┬── S4-3 compact dedup ──┐
-                                                          └── S4-4 sub-partition ──┴── S4-5 60M check ── H7 submit
+S4-0 (done) ─ W1: S4-3 exact-key dedup ─ W2: S4-1 flat scatter ─ W3: S4-2 split bits → S4-4 screen ─ W4: S4-5 validate ─ H7
 ```
 
----
+**Wave rules (supersede the old card order).** Every card merges through G1 in all configs + G4 + G3 before/after, plus a pinned serial **60M wall** comparison against its card's parent: same host, warm-cache procedure, `NCPU=8 taskset -c 0-3,8-11`, nothing else running. Confirm any promising delta with ≥ 3 runs per version in alternating order; keep the parent when ranges overlap. One card at a time. Tiny-knob configs are correctness-only (G1 data), never 60M.
 
-**S4-0 — Re-profile** · Scope: `research/perf/00-profile-s3.md` (new) · Depends: H6 · 1 h
-- Same method as `research/perf/00-profile.md` (gperftools if `perf` is unavailable), on the #3 code at p20.
-- Output: the top 25 symbols and phase table. If dedup + sessions are no longer ≥ 30% of CPU, stop and re-rank with the synthesis.
+**S4-0 — Profile** · Done (R2-0). `research/perf2/00-profile.md` replaces the p20-only profile: 60M phase table, top-40 symbols, faults.
 
----
+**W1 · S4-3 — Exact-key compact dedup** · Scope: `src/v2/mod.rs` (P2), focused tests; optional private `src/v2/dedup.rs` · Depends: S4-0 · **cap 3 h** incl. gates · hypothesis 250–400 ms at 60M
+- Replace the bucket-local `HashMap<u128, EvRaw>` with an exact-key map from the full event id to a dense winner index. Append a payload only on vacancy; on a smaller `ingest_s`, overwrite the existing winner in place. Checked indices (`usize`); never pack or truncate a row index or worker id.
+- Keep P2's output representation in this card. Semantics are mechanically identical: min `ingest_s` wins, equal-ingest copies are interchangeable, invalid survivors are still dropped after dedup (E5), the winner's user is resolved to a person exactly once (E4). Keep the current reducer as a test oracle.
+- Accept: randomized shuffled cross-chunk duplicates vs the old reducer; forced-collision ids; earlier-invalid/later-valid and earlier-different-user cases; equal-ingest; empty buckets. Plus the common gates and the 60M wall/anon comparison. A P2 win that regresses total wall is not a win.
 
-**S4-1 — Counted person scatter** · Scope: `src/v2/mod.rs` (P2 → P3 handoff), `src/v2/sessions.rs` (`run_bucket` input) · Depends: S4-0 · 3–4 h · est. 100–300 ms
-- Each dedup task writes its survivors into **one** `Vec<Ev>` grouped by person bucket, with an `offsets: Vec<u32>` of length `nb_person + 1`. Count first, prefix-sum, then fill, replacing `Vec<Vec<Ev>>` (`mod.rs:149`).
-- P3 reads bucket `p` as the slices `task.evs[offsets[p]..offsets[p+1]]` across tasks. Concatenate as today, or sort the slices in place if `run_bucket` is changed to take a gathered buffer.
-- Clicks keep their S3-5 per-worker pre-sized buckets.
-- Accept: G1 (all configs) + G4. Report the `dedup` and `sessions` phase times.
+**W2 · S4-1 — Flat counted person scatter** · Scope: `src/v2/mod.rs` (P2 output, P3 gather) · Depends: S4-0, and W1's accepted state · **cap 2.5 h** · hypothesis 100–300 ms
+- Reuse the existing valid-winner count pass (`mod.rs:238-247`) and the person cached there; prefix-sum into checked offsets per dedup task; fill **one** contiguous `Vec<Ev>` per task with disjoint per-person-bucket ranges. P3 concatenates the corresponding slices (empty ones included) and sorts as today. Clicks keep their S3-5 buckets.
+- Accept: multiset equality vs the old nested scatter on empty, single-bucket and heavily skewed inputs; offset ends equal final counts; common gates; 60M wall and anon.
 
----
+**W3 · S4-2 — Split bucket controls** · Scope: `src/v2/mod.rs`, D14, tests · Depends: S4-1 · **cap 1 h**, plus the 0.5 h S4-4 screen
+- `SHOPT_DEDUP_BITS` controls the P1 event scatter and P2 tasks; `SHOPT_PERSON_BITS` controls P2 person output, click scatter and P3. Each overrides its side of the legacy `SHOPT_BUCKET_BITS` shorthand, which keeps working when set alone. Preserve 0-bit (single bucket) behavior; bound or reject an absurd requested product before allocation — never omit buckets.
+- Accept: asymmetric (1,3)/(3,1), shorthand precedence, both-at-1 tiny config (§7 updated), G1 + G4 at the chosen defaults.
 
-**S4-2 — Separate dedup and person bucket counts** · Scope: `src/v2/mod.rs`, `PLAN.md` D14 · Depends: S4-1 · 1–2 h
-- Replace `SHOPT_BUCKET_BITS` with `SHOPT_DEDUP_BITS` (P1 event scatter and P2 tasks) and `SHOPT_PERSON_BITS` (P2 output, click scatter and P3). The two now vary independently. Keep `SHOPT_BUCKET_BITS` working as a shorthand that sets both.
-- A/B on p20: `SHOPT_DEDUP_BITS` ∈ {8, 10, 11, 12} × `SHOPT_PERSON_BITS` ∈ {8, 10}. Set the defaults to the best median, and expect ≥ 10 dedup bits (L2-sized buckets).
-- Accept: G1 with both knobs at 1, and at the chosen defaults; G4.
+**W3 · S4-4 — Partition screen, not a sub-sort** · Scope: experiment only; only S4-2 defaults may change · **cap 0.5 h**
+- At p60, screen (dedup, person) = (8,8) → (10,8) → (10,11), one axis at a time; confirm the best against (8,8) by the common comparison protocol. Keep the old defaults when noisy. Report dedup, sessions, total and anon. Do not infer L2 fit from mean bucket size. The original S4-4 sub-partition code is dropped (synthesis: its per-bucket rank pass costs more than it saves).
 
----
+**W4 · S4-5 — Validate the final candidate** · Scope: none unless a fix is needed · Depends: last accepted wave · **reserve 2 h**
+- The S3-9 procedure on the #4 code: 60M self-checks, sampled peak anon ≤ 10 GB (a lower bound; report VmHWM separately), 5M seeds 51–53 vs the reference, native wall and cache conditions recorded, G2 Docker (36/36, dev MATCH < 30 s), G1/G3/G4 re-confirmed on the selected source.
 
-**S4-3 — Compact dedup table** · Scope: `src/v2/dedup.rs` (new), `src/v2/mod.rs` (P2) · Depends: S4-2 · 6–8 h · est. 500–1,000 ms (with S4-2)
-- Replace `HashMap<u128, EvRaw>` (`mod.rs:133`) with an open-addressing table. Slots hold `(fingerprint: u32 or u64, idx: u32)`; size is a power of two ≥ 2 × bucket length; linear probing.
-- `idx` encodes `(worker << 27) | offset` into the per-worker `EvRaw` slices (S3-5 guarantees ≤ 16 workers; assert `offset < 2^27`).
-- Hash: reuse `id::mix(id)`. Bucket selection already uses its top bits, so the table uses the low bits.
-- On a fingerprint match, **compare the full `u128` id**: never trust the hash alone.
-- Keep the min `ingest_s` copy; on equal `ingest_s`, either copy is fine (identical).
-- Accept:
-  - A unit test with a forced-collision hash (test-only hook that maps every id to the same fingerprint) giving the same result as `HashMap`.
-  - A randomized test against the current `HashMap` dedup.
-  - G1 (all configs, with `SHOPT_DEDUP_BITS=1`) + G4.
-- Traps: E4 (kept copy's user), E5 (invalid kept copy drops the event).
-
----
-
-**S4-4 — Sub-partition person buckets before sorting** · Scope: `src/v2/sessions.rs` (`run_bucket`, `:186`) · Depends: S4-2 · 4–6 h · est. 150–400 ms
-- Inside `run_bucket`, hash-partition `evs` and `cks` by a **second** hash of `person` (bits of `id::mix(person)` disjoint from the bucket bits) into `k` sub-runs. Choose `k` so each sub-run is ≤ ~16k `Ev` (≈ 0.5 MB); `k` = 1 for small buckets.
-- Events and clicks use the same function, so a person's events and clicks always land in the same sub-run. Then sort and walk each sub-run exactly as today.
-- No dense person index, so `u128` person order is kept and the merge-join by `person` still works (`sessions.rs` run_bucket).
-- Accept: G1 (all configs) + G4. Plus a unit test where one person has events in a bucket and clicks only in the same sub-run.
-- Traps: E16 (equal ts), A5 (credit tie), whale person (one sub-run may be large; that's fine).
-
----
-
-**S4-5 — 60M check** · Same as S3-9 on the #4 code. Accept: peak anon ≤ 10 GB, self-checks, 5M seeds match, 60M time recorded.
-
----
+**Budget and cut line:** 3 + 2.5 + 1 + 0.5 + 2 = 9 h. Card caps are stop rules, not grounds for skipping tests. Reserve validation before opening any new card. Stop optimizing by Sun 04:30 ET to hold the 05:30 validation and 06:00 submission slots; if gates overrun, drop W3 first, then unfinished W2, and never half-land the knob split. If nothing beats #3 measurably, ship #3.
 
 **H7 — Submit #4** · Human · §8 protocol.
 
----
+### Hybrid: Pass 2′ is now two lines (chosen Sat ~21:45 ET)
 
+Two syntheses exist:
+- `research/perf2/SYNTHESIS.md`: conservative. It is the W1–W4 cards above.
+- `research/perf2/SYNTHESIS-alt.md`: adds the thin-tuple dedup and a huge-page re-test. Its cards are in `research/perf2/PASS2-ALT.md`.
+
+The hybrid runs both, as two lines that never share a P2 rewrite.
+
+```
+A0 bench@60M + lock (first, ~45 min; both lines need it)
+├─ Line 1 → #4 (safe):     W1 ─ W2 ─ W3 ─ W4 ─ H7          [cards above, unchanged]
+│    └─ side worktree:     A1 sys-time diagnosis ─ A2 huge-page alloc   → merged into Line 1 before W4, only if accepted
+└─ Line 2 → #5 (stretch):  B1 thin dedup (from e6f1279) ─ B2 bits A/B ─ B3 60M check + G2 ─ H8
+                           #5 = e6f1279 + A0 + (A2 if accepted) + B1 + B2. W1–W3 are NOT in #5: B1 replaces P2.
+```
+
+**Cards:**
+- **A0, A1, A2:** as written in `research/perf2/PASS2-ALT.md`, run in a side worktree.
+- **A2's evidence:** it is adopted only on its result under THP `madvise`. The S3-8 "negative A/B" doesn't count against it, because it ran under THP `always`, which hides the effect (see `SYNTHESIS-alt.md`).
+- **B1–B3:** as written in `PASS2-ALT.md`. B1's own `SHOPT_DEDUP_BITS` / `SHOPT_PERSON_BITS` stand in for W3 on Line 2.
+- **Optional, if an implementer is idle:** A3 (timestamps, `07`) and A4 (background unmap). Either one goes into whichever line is ahead.
+
+**Benchmarks:** each line's cards may run in parallel worktrees. `make bench` holds `.bench.lock` (A0), so timed runs never overlap. Every benchmark follows the machine-state rule: THP `madvise`, swap cleared, `free -g` recorded.
+
+**Deadlines (ET):**
+
+| Time | Milestone |
+|---|---|
+| Sat 22:45 | A0 merged; `data/p60.ref` created |
+| Sun 02:00 | A2 decision (adopt or drop) |
+| Sun 03:30 | B1 go/no-go: it passes G1 or Line 2 stops |
+| Sun 04:30 | Both lines stop optimizing |
+| Sun 05:30 | W4 and B3 validation done |
+| ~Sun 06:00 | Submit #4, then #5 (3 per hour allows both) |
+
+**H4 (rule change):** pick the build with the best **local 60M bench median** among accepted submissions that passed every gate. The 20M practice time breaks ties only.
+
+---
 ### Not in these passes (decided)
-Full AVX2 structural scanner (pi 01 #1; a candidate for a Submission #5 if time remains after #4), timestamp SWAR fast path (pi 02), packed-`u64` radix sort, parse clicks during dedup, person-map prefetch, hand-written Parquet, PGO, AVX-512, fused streaming P1→P2, parallel union-find.
+Full AVX2 structural scanner (round-1 01; round-2 03 keeps only span-fast `split` as a fallback card), packed-`u64` radix sort, hand-written Parquet, PGO, AVX-512, fused streaming P1→P2, parallel union-find, fork-and-exit tricks (defeated by PID-namespace teardown).
+
+**Round-2 rejections** (evidence in `research/perf2/SYNTHESIS.md`): global atomic winner table and two-pass parse (02); fingerprint-only slots without full-key verify; arena/THP experiments (01, 04 — S3-8 already rejected the env default and the host A/B was negative; **overridden by the hybrid:** A2 re-tests huge pages under THP `madvise`); click–dedup overlap and the person-probe memo (06, 08 — measurement-gated with uncertain expected value); timestamp fast paths (07 — deferred behind the dedup budget); original S4-4 sub-partition code (05).
 
 **H4 — Final pick and freeze** · Human · Sun 09:00 AM ET
 - Pick the fastest commit that passed G1 + G2 + G4, the latest 60M check, and an accepted practice run. Make sure it's pushed and the repo is public. No new submissions after freeze unless the current best is broken.
