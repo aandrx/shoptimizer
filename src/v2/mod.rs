@@ -51,6 +51,26 @@ fn prealloc_cap(total_bytes: usize, bytes_per_row: usize, workers: usize, nb: us
     (rows as u64 * 115 / (100 * workers.max(1) as u64 * nb.max(1) as u64)) as usize
 }
 
+/// Total record count per bucket across every worker's bucket set.
+///
+/// Computed once per bucket set (S3-6) so P3 neither rescans the parts per
+/// bucket nor pays for it twice.
+fn bucket_lens<T: Sync>(parts: &[Vec<Vec<T>>], nb: usize) -> Vec<usize> {
+    (0..nb)
+        .into_par_iter()
+        .map(|b| parts.iter().map(|p| p[b].len()).sum())
+        .collect()
+}
+
+/// P3 schedule (S3-6): buckets in descending order of their total `Ev` count so
+/// the whale bucket starts first instead of finishing last. Ties keep bucket
+/// index order, making the schedule deterministic.
+fn bucket_order(ev_lens: &[usize]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..ev_lens.len()).collect();
+    order.sort_unstable_by(|&a, &b| ev_lens[b].cmp(&ev_lens[a]).then(a.cmp(&b)));
+    order
+}
+
 /// P1 scatter: exactly one bucket set per worker, chunks pulled from a shared
 /// index (D14, D9).
 ///
@@ -243,18 +263,18 @@ fn run_v2(data: &Path, out: &Path, on_success: impl FnOnce()) -> io::Result<bool
 
     // ---- P3: sessions per person bucket
     let started = Instant::now();
-    let acc = (0..nb)
+    let ev_lens = bucket_lens(&ev_out, nb);
+    let ck_lens = bucket_lens(&ck_parts, nb);
+    let acc = bucket_order(&ev_lens)
         .into_par_iter()
         .fold(
             || Acc::new(&ctx),
             |mut acc, b| {
-                let n: usize = ev_out.iter().map(|o| o[b].len()).sum();
-                let mut evs: Vec<Ev> = Vec::with_capacity(n);
+                let mut evs: Vec<Ev> = Vec::with_capacity(ev_lens[b]);
                 for o in &ev_out {
                     evs.extend_from_slice(&o[b]);
                 }
-                let n: usize = ck_parts.iter().map(|p| p[b].len()).sum();
-                let mut cks: Vec<Ck> = Vec::with_capacity(n);
+                let mut cks: Vec<Ck> = Vec::with_capacity(ck_lens[b]);
                 for p in &ck_parts {
                     cks.extend_from_slice(&p[b]);
                 }
@@ -348,6 +368,24 @@ mod tests {
         assert_eq!(prealloc_cap(0, 70, 16, 256), 0);
         // Degenerate divisors never panic or divide by zero.
         assert_eq!(prealloc_cap(700, 0, 0, 0), 700 * 115 / 100);
+    }
+
+    #[test]
+    fn bucket_lens_sums_every_worker() {
+        // Two workers, four buckets: counts add up across parts, empties stay 0.
+        let parts: Vec<Vec<Vec<u8>>> = vec![
+            vec![vec![1, 2], vec![], vec![3], vec![4]],
+            vec![vec![5], vec![], vec![], vec![]],
+        ];
+        assert_eq!(bucket_lens(&parts, 4), vec![3, 0, 1, 1]);
+        assert_eq!(bucket_lens::<u8>(&[], 2), vec![0, 0]);
+    }
+
+    #[test]
+    fn bucket_order_is_largest_first_then_index() {
+        assert_eq!(bucket_order(&[3, 9, 3, 0, 9]), vec![1, 4, 0, 2, 3]);
+        assert_eq!(bucket_order(&[0, 0, 0]), vec![0, 1, 2]);
+        assert!(bucket_order(&[]).is_empty());
     }
 
     #[test]
