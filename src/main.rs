@@ -109,11 +109,138 @@ pub(crate) mod iostats {
     static LAST: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
     static HAVE_LAST: AtomicBool = AtomicBool::new(false);
 
+    /// `/proc/vmstat` counters sampled per phase, in report order.
+    const VM_KEYS: [&[u8]; 7] = [
+        b"pgfault",
+        b"thp_fault_alloc",
+        b"thp_fault_fallback",
+        b"compact_stall",
+        b"pgscan_direct",
+        b"pswpin",
+        b"pswpout",
+    ];
+
+    // Previous values of the VM_KEYS counters, for per-phase deltas. The baseline
+    // is taken by `init` before the pipeline starts, because these counters are
+    // system-wide rather than per-process.
+    static LAST_VM: [AtomicU64; 7] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+    static HAVE_VM: [AtomicBool; 7] = [
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+    ];
+    static INITED: AtomicBool = AtomicBool::new(false);
+
+    /// Previous getrusage CPU times, for per-phase deltas; the first line is
+    /// measured from process start, as for the fault counters.
+    static LAST_CPU: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    static HAVE_CPU: AtomicBool = AtomicBool::new(false);
+
+    /// A `key value` counter line from `/proc/vmstat`.
+    fn parse_vmstat(bytes: &[u8], key: &[u8]) -> Option<u64> {
+        for line in bytes.split(|&b| b == b'\n') {
+            let Some(rest) = line.strip_prefix(key) else {
+                continue;
+            };
+            // Require whitespace after the key so `pgfault` can't match a longer
+            // name that starts with it.
+            if !rest.first().is_some_and(u8::is_ascii_whitespace) {
+                continue;
+            }
+            let start = rest.iter().position(u8::is_ascii_digit)?;
+            let end = rest[start..]
+                .iter()
+                .position(|b| !b.is_ascii_digit())
+                .map_or(rest.len(), |p| start + p);
+            return parse_u64(&rest[start..end]);
+        }
+        None
+    }
+
+    /// All [`VM_KEYS`] counters from one read of `/proc/vmstat`.
+    fn vmstat() -> [Option<u64>; VM_KEYS.len()] {
+        let Ok(bytes) = std::fs::read("/proc/vmstat") else {
+            return [None; VM_KEYS.len()];
+        };
+        let mut values = [None; VM_KEYS.len()];
+        for (slot, key) in values.iter_mut().zip(VM_KEYS) {
+            *slot = parse_vmstat(&bytes, key);
+        }
+        values
+    }
+
+    /// `(user, system)` CPU microseconds consumed by the whole process.
+    fn cpu_times() -> Option<(u64, u64)> {
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+            return None;
+        }
+        let micros = |tv: &libc::timeval| {
+            tv.tv_sec.max(0) as u64 * 1_000_000 + tv.tv_usec.max(0) as u64
+        };
+        Some((micros(&usage.ru_utime), micros(&usage.ru_stime)))
+    }
+
+    /// `AnonHugePages` in kB from one read of `/proc/self/smaps_rollup`.
+    fn anon_hugepages() -> Option<u64> {
+        std::fs::read("/proc/self/smaps_rollup")
+            .ok()
+            .and_then(|bytes| parse_status_kb(&bytes, b"AnonHugePages:"))
+    }
+
+    /// Takes the system-wide vmstat baseline before the pipeline starts. No-op
+    /// when the instrumentation is disabled, so default output stays unchanged.
+    pub fn init() {
+        if !enabled() || INITED.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        for (index, value) in vmstat().into_iter().enumerate() {
+            if let Some(value) = value {
+                LAST_VM[index].store(value, Ordering::Relaxed);
+                HAVE_VM[index].store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Per-counter delta, or `None` when the counter could not be read.
+    fn delta(current: Option<u64>, last: &AtomicU64, have: &AtomicBool) -> Option<u64> {
+        let current = current?;
+        let previous = last.swap(current, Ordering::Relaxed);
+        Some(if have.swap(true, Ordering::Relaxed) {
+            current.saturating_sub(previous)
+        } else {
+            current
+        })
+    }
+
+    fn plus(value: Option<u64>) -> String {
+        value.map_or_else(|| "?".to_string(), |v| format!("+{v}"))
+    }
+
+    fn kb(value: Option<u64>) -> String {
+        value.map_or_else(|| "?".to_string(), |v| format!("{v}kB"))
+    }
+
     pub fn log_phase(name: &str, started: Instant) {
         if !enabled() {
             eprintln!("[phase] {name} {}ms", started.elapsed().as_millis());
             return;
         }
+        // Normally already done by `run`; this only matters for a phase line
+        // logged before that baseline, so its own I/O is not in the phase time.
+        init();
         let ms = started.elapsed().as_millis();
         let (minflt, majflt) = faults().unwrap_or((0, 0));
         let prev_min = LAST[0].swap(minflt, Ordering::Relaxed);
@@ -125,13 +252,55 @@ pub(crate) mod iostats {
         } else {
             (minflt, majflt)
         };
+        let (d_user, d_sys) = match cpu_times() {
+            Some((user, sys)) => {
+                let have_cpu = HAVE_CPU.swap(true, Ordering::Relaxed);
+                let prev_user = LAST_CPU[0].swap(user, Ordering::Relaxed);
+                let prev_sys = LAST_CPU[1].swap(sys, Ordering::Relaxed);
+                if have_cpu {
+                    (
+                        Some(user.saturating_sub(prev_user)),
+                        Some(sys.saturating_sub(prev_sys)),
+                    )
+                } else {
+                    (Some(user), Some(sys))
+                }
+            }
+            None => (None, None),
+        };
+        let current_vm = vmstat();
+        let mut d_vm = [None; VM_KEYS.len()];
+        for index in 0..VM_KEYS.len() {
+            d_vm[index] = delta(current_vm[index], &LAST_VM[index], &HAVE_VM[index]);
+        }
         let (anon, file) = rss();
         eprintln!(
             "[phase] {name} {ms}ms minflt=+{d_min} majflt=+{d_maj} \
-             RssAnon={}kB RssFile={}kB",
+             RssAnon={}kB RssFile={}kB user={}us sys={}us \
+             pgfault={} thp_fault_alloc={} thp_fault_fallback={} \
+             compact_stall={} pgscan_direct={} pswpin={} pswpout={} \
+             AnonHugePages={}",
             anon.map_or_else(|| "?".to_string(), |v| v.to_string()),
             file.map_or_else(|| "?".to_string(), |v| v.to_string()),
+            plus(d_user),
+            plus(d_sys),
+            plus(d_vm[0]),
+            plus(d_vm[1]),
+            plus(d_vm[2]),
+            plus(d_vm[3]),
+            plus(d_vm[4]),
+            plus(d_vm[5]),
+            plus(d_vm[6]),
+            kb(anon_hugepages()),
         );
+    }
+
+    /// Wall-clock milliseconds since the process started on the timed path, for
+    /// subtracting the exit teardown from the bench wall. No-op unless enabled.
+    pub fn log_exit(started: Instant) {
+        if enabled() {
+            eprintln!("[exit] t={}ms", started.elapsed().as_millis());
+        }
     }
 
     /// Kernel-tracked peak resident set (whole RSS, not the anon cap) at exit.
@@ -181,6 +350,36 @@ pub(crate) mod iostats {
         }
 
         #[test]
+        fn vmstat_fields() {
+            const VMSTAT: &[u8] = b"nr_free_pages 123\npgfault 456 789\nthp_fault_alloc 7\nthp_fault_fallback 8\ncompact_stall 9\npgscan_direct 10\npswpin 11\npswpout 12\npgfault_extra 99\n";
+            assert_eq!(parse_vmstat(VMSTAT, b"pgfault"), Some(456));
+            assert_eq!(parse_vmstat(VMSTAT, b"thp_fault_alloc"), Some(7));
+            assert_eq!(parse_vmstat(VMSTAT, b"thp_fault_fallback"), Some(8));
+            assert_eq!(parse_vmstat(VMSTAT, b"compact_stall"), Some(9));
+            assert_eq!(parse_vmstat(VMSTAT, b"pgscan_direct"), Some(10));
+            assert_eq!(parse_vmstat(VMSTAT, b"pswpin"), Some(11));
+            assert_eq!(parse_vmstat(VMSTAT, b"pswpout"), Some(12));
+            assert_eq!(parse_vmstat(VMSTAT, b"pgfault_extra"), Some(99));
+            assert_eq!(parse_vmstat(VMSTAT, b"missing"), None);
+            assert_eq!(parse_vmstat(b"pgfault\n", b"pgfault"), None);
+        }
+
+        #[test]
+        fn vmstat_real_proc_vmstat() {
+            let vmstat = std::fs::read("/proc/vmstat").expect("/proc/vmstat");
+            assert!(parse_vmstat(&vmstat, b"pgfault").is_some());
+            let _ = parse_vmstat(&vmstat, b"thp_fault_alloc");
+            let _ = parse_vmstat(&vmstat, b"compact_stall");
+            let _ = parse_vmstat(&vmstat, b"pswpin");
+        }
+
+        #[test]
+        fn cpu_times_real_getrusage() {
+            let (user, sys) = cpu_times().expect("getrusage(RUSAGE_SELF)");
+            let _ = (user, sys);
+        }
+
+        #[test]
         fn status_real_proc_status() {
             let status = std::fs::read("/proc/self/status").expect("/proc/self/status");
             assert!(parse_status_kb(&status, b"VmHWM:").is_some());
@@ -222,6 +421,8 @@ fn phase(name: &str, started: Instant) {
 }
 
 fn run() -> io::Result<()> {
+    // System-wide vmstat baseline, before any pipeline work; no-op by default.
+    iostats::init();
     let (data, out) = match paths() {
         Ok(paths) => paths,
         Err(message) => {
@@ -248,6 +449,7 @@ fn run() -> io::Result<()> {
         v2::run_with(&data, &out, || {
             phase("total", started);
             iostats::log_peak();
+            iostats::log_exit(started);
             let _ = io::stderr().flush();
             std::process::exit(0);
         })?;

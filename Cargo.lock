@@ -439,6 +439,7 @@ name = "shoptimizer"
 version = "0.1.0"
 dependencies = [
  "hashbrown",
+ "libc",
  "memchr",
  "memmap2",
  "mimalloc",

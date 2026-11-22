@@ -15,6 +15,7 @@ memmap2 = "0.9"
 mimalloc = { version = "0.1", default-features = false }
 hashbrown = "0.17"
 memchr = "2.8"
+libc = "0.2"
 
 [profile.release]
 lto = "fat"
