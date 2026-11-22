@@ -39,8 +39,24 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// Runs V2 and drops everything normally when it returns.
+///
+/// This is the entry point for tests and any caller that wants teardown to run;
+/// the binary uses [`run_with`] instead.
+#[allow(dead_code)]
 pub fn run(data: &Path, out: &Path) -> io::Result<()> {
-    if run_v2(data, out)? {
+    run_with(data, out, || ())
+}
+
+/// Runs V2 and calls `on_success` once both Parquet writers have returned (files
+/// closed), while this frame still owns the pipeline's heavy state (`acc`, the
+/// mmaps, the maps). That lets the binary exit the process without paying for a
+/// teardown it doesn't need.
+///
+/// `on_success` is only called on a successful V2 run: errors and the V1
+/// fallback keep normal drops, so no memory is deliberately leaked there.
+pub fn run_with(data: &Path, out: &Path, on_success: impl FnOnce()) -> io::Result<()> {
+    if run_v2(data, out, on_success)? {
         Ok(())
     } else {
         eprintln!("[v2] input doesn't fit the compact encoding; falling back to v1");
@@ -49,7 +65,7 @@ pub fn run(data: &Path, out: &Path) -> io::Result<()> {
 }
 
 /// `Ok(false)` = fall back to V1 (nothing has been written yet).
-fn run_v2(data: &Path, out: &Path) -> io::Result<bool> {
+fn run_v2(data: &Path, out: &Path, on_success: impl FnOnce()) -> io::Result<bool> {
     let started = Instant::now();
     let manifest = fs::read(data.join("manifest.json"))?;
     let window = Window::parse(&manifest)
@@ -163,7 +179,8 @@ fn run_v2(data: &Path, out: &Path) -> io::Result<bool> {
             out
         })
         .collect();
-    drop(ev_parts);
+    // S3-3: free the parse buffers in the background instead of on the critical path.
+    std::thread::spawn(move || drop(ev_parts));
     phase("dedup", started);
 
     // ---- P3: sessions per person bucket
@@ -189,8 +206,9 @@ fn run_v2(data: &Path, out: &Path) -> io::Result<bool> {
         )
         .reduce_with(Acc::merge)
         .unwrap_or_else(|| Acc::new(&ctx));
-    drop(ev_out);
-    drop(ck_parts);
+    // S3-3: background frees while the Parquet writers run.
+    std::thread::spawn(move || drop(ev_out));
+    std::thread::spawn(move || drop(ck_parts));
     phase("sessions", started);
 
     // ---- P4: write
@@ -198,6 +216,10 @@ fn run_v2(data: &Path, out: &Path) -> io::Result<bool> {
     write_users(&out.join("user_daily"), &acc.users, &ctx)?;
     write_campaigns(&out.join("campaign_daily"), &acc.camp, &ctx)?;
     phase("write", started);
+    // Both writers have returned, so their output files are closed. `acc`, the
+    // mmaps and the lookup maps are still live here; the callback is where the
+    // binary exits instead of dropping them.
+    on_success();
     Ok(true)
 }
 
